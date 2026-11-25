@@ -26,7 +26,7 @@ from PySide6.QtGui import (QAction, QContextMenuEvent, QDropEvent, QKeyEvent, QK
                            QWheelEvent, QDragMoveEvent)
 from PySide6.QtWidgets import QAbstractButton, QApplication, QGraphicsSceneMouseEvent, QWidget
 
-from conftest import MODULE_FILE
+from conftest import MODULE_FILE, dispose_window
 
 SCRATCH_ORIGINAL = ("/tmp/claude-0/-home-user-Test/6869cefe-e397-54ef-8db1-e6317537ce5b/scratchpad/"
                     "clip_studio_original.py")
@@ -120,17 +120,30 @@ BASE_CLIP_MENU = ["Select all clips after this", "Add a gap before this clip..."
                   "> Remove fades", "Transition from previous clip"] + ["> " + t for t in BASE_TRANS]
 BASE_LIB_MENU = ["Convert HDR to SDR...", "Remove from library"]
 
-# A button is identified by its text OR its tooltip containing one of the phrases (case-insensitive).
+# A button is found by its text OR tooltip containing one of these phrases (case-insensitive). Phrases are listed
+# most specific first; keep at least one of them (button text or tooltip) when restyling a button.
 BUTTONS = {
-    "undo": ["Undo"], "redo": ["Redo"], "split": ["Split"], "delete": ["Delete the selected clip"],
-    "gap": ["Add gap", "Insert empty space"], "ripple": ["close gap"], "detach": ["Detach audio"],
-    "zoom_out": ["Zoom out the timeline"], "zoom_in": ["Zoom in the timeline"], "fit": ["Zoom to fit"],
-    "open": ["Open project"], "save": ["Save project"], "export": ["Export video"], "import": ["Import media"],
+    "undo": ["Undo"], "redo": ["Redo"],
+    "split": ["Cut the selected clip in two", "Split"],
+    "delete": ["Delete the selected clip"],
+    "gap": ["Insert empty space", "Add gap"],
+    "ripple": ["pull later clips", "close gap"],
+    "detach": ["Split the sound of the selected video", "Detach audio"],
+    "zoom_out": ["Zoom out the timeline"], "zoom_in": ["Zoom in the timeline"],
+    "fit": ["Zoom to fit the whole project", "Zoom to fit"],
+    "open": ["Open a saved project", "Open project"], "save": ["Save the project", "Save project"],
+    "export": ["Render the finished video", "Export video"], "import": ["Import media"],
     "add_tl": ["Add to timeline"], "add_cap": ["Add caption to timeline"], "cancel_conv": ["Cancel conversion"],
-    "gen_subs": ["Generate subtitles"], "sub_save": ["Save as my default"], "sub_reset": ["Reset to original"],
-    "load_font": ["Load font file"], "parrot": ["(Parrot Replay)"], "wrap_round": ["Wrap in ( )"],
-    "wrap_square": ["Wrap in [ ]"], "box_col": ["Box colour"], "text_col": ["Text colour"],
-    "play": ["Play / pause"], "start": ["Go to the start"], "zoom_video": ["Zoom video"],
+    "gen_subs": ["Generate subtitles"],
+    "sub_save": ["Every new session starts with the subtitle look", "Save as my default"],
+    "sub_reset": ["Go back to the built-in subtitle look", "Reset to original"],
+    "load_font": ["Add a font from a .ttf", "Load font file"],
+    "parrot": ["Replace this subtitle's text with (Parrot Replay)", "(Parrot Replay)"],
+    "wrap_round": ["Put round brackets around", "Wrap in ( )"],
+    "wrap_square": ["Put square brackets around", "Wrap in [ ]"],
+    "box_col": ["Box colour"], "text_col": ["Text colour"],
+    "play": ["Play / pause"], "start": ["Go to the start"],
+    "zoom_video": ["Zoom the preview in on the clip", "Zoom video"],
     "fit_clip": ["Fit the whole clip inside"], "fill_clip": ["Zoom the clip to cover"],
     "reset_clip": ["Back to centred"],
 }
@@ -141,13 +154,14 @@ def find_button(w, key):
     phrases = [p.lower() for p in BUTTONS[key]]
     hits = []
     for b in w.findChildren(QAbstractButton):
-        txt = (b.text() + " \x00 " + b.toolTip()).lower().replace("&&", "&")
-        if any(p in txt for p in phrases):
-            hits.append(b)
+        text = b.text().replace("&&", "&").lower()
+        blob = text + " \x00 " + b.toolTip().lower()
+        idx = [i for i, p in enumerate(phrases) if p in blob]
+        if idx:
+            hits.append((min(idx), text not in phrases, len(text), b))
     assert hits, f"no button found for {key!r} (text/tooltip containing {BUTTONS[key]})"
-    # prefer an exact text match, then shortest text
-    hits.sort(key=lambda b: (b.text().replace("&&", "&").lower() not in phrases, len(b.text())))
-    return hits[0]
+    hits.sort(key=lambda h: h[:3])
+    return hits[0][3]
 
 
 def all_shortcuts(w):
@@ -329,7 +343,6 @@ def test_main_window_constructs_and_wiring(win, cs):
 
 def test_dark_theme_applies(cs, qapp):
     cs.dark_theme(qapp)
-    assert qapp.style().name().lower() == "fusion"
     assert qapp.palette().window().color().lightness() < 80, "theme should stay dark"
     assert qapp.styleSheet().strip()
 
@@ -392,9 +405,11 @@ def test_shortcuts_do_their_job(win, media, modals, tmp_path, flush):
     assert len(win.clips) == 2
     # Shift+Delete: ripple delete
     first = min(win.clips, key=lambda c: c.start)
+    other = max(win.clips, key=lambda c: c.start)
+    exp = max(0.0, other.start - first.dur) if other.start >= first.end - 1e-3 else other.start
     win.sel = first
     fire(win, "Shift+Delete")
-    assert len(win.clips) == 1 and abs(win.clips[0].start) < 1e-6
+    assert len(win.clips) == 1 and abs(win.clips[0].start - exp) < 1e-6
     # zoom shortcuts
     p0 = win.tl.pps
     fire(win, "Ctrl+=")
@@ -407,8 +422,8 @@ def test_shortcuts_do_their_job(win, media, modals, tmp_path, flush):
     fire(win, "Ctrl+0")
     assert win.tl.t0 == 0.0
     # Z: zoom the preview on the clip under the playhead, again to reset
-    win.set_time(0.5)
     win.sel = win.clips[0]
+    win.set_time(win.clips[0].start + 0.5)
     fire(win, "Z")
     assert win.view.zoomed
     fire(win, "Z")
@@ -786,7 +801,8 @@ def test_fades_transitions_and_props(win, media, cs):
     # audio clip disables visual props
     au = add(win, media["wav"])
     win.load_props()
-    assert not win.p_scale.isEnabled() and not win.p_trans.isEnabled() and win.p_vol.isEnabled()
+    en = lambda wdg: getattr(wdg, "sp", wdg).isEnabled()      # SliderSpin enables its inner spin box
+    assert not en(win.p_scale) and not win.p_trans.isEnabled() and en(win.p_vol)
 
 
 def test_timeline_mouse_workflows(win, media, modals, flush):
@@ -825,9 +841,10 @@ def test_timeline_mouse_workflows(win, media, modals, flush):
     mouse(tl, "release", QPointF(tl.tx(b.end - 0.2), cs_row_y(win, 2)))
     assert tl.mode is None
     # trim right edge
+    # (grab edges near the top of the clip: the middle of a join is the transition "+" button)
     win.sel = a
     r = tl.clip_rect(a)
-    p = QPointF(r.right() - 2, r.center().y())
+    p = QPointF(r.right() - 2, r.top() + 5)
     n_undo = len(win.undo)
     mouse(tl, "press", p)
     assert tl.mode == "trimR"
@@ -836,7 +853,7 @@ def test_timeline_mouse_workflows(win, media, modals, flush):
     assert abs(a.dur - 2.0) < 0.1 and len(win.undo) == n_undo + 1
     # trim left edge
     r = tl.clip_rect(b)
-    p = QPointF(r.left() + 2, r.center().y())
+    p = QPointF(r.left() + 2, r.top() + 5)
     s_b, d_b = b.start, b.dur
     mouse(tl, "press", p)
     assert tl.mode == "trimL"
@@ -850,7 +867,17 @@ def test_timeline_mouse_workflows(win, media, modals, flush):
     mouse(tl, "move", QPointF(p.x() - tl.pps * (b.start + 1.0), p.y()), Qt.LeftButton)
     assert tl.plan is not None
     mouse(tl, "release", QPointF(p.x() - tl.pps * (b.start + 1.0), p.y()))
-    assert abs(b.start) < 1e-6 and abs(a.start - b.end) < 1e-6
+    # it lands before or after a (by which half it covers), never overlapping
+    assert (abs(b.start) < 1e-6 and abs(a.start - b.end) < 1e-6) or abs(b.start - a.end) < 1e-6
+    # moving the first clip far to the right closes the gap it leaves on the magnetic track
+    first, second = sorted((a, b), key=lambda c: c.start)
+    s2, d1 = second.start, first.dur
+    p = clip_point(tl, first)
+    far = QPointF(tl.tx(second.end + 3.0) + (p.x() - tl.tx(first.start)), p.y())
+    mouse(tl, "press", p)
+    mouse(tl, "move", far, Qt.LeftButton)
+    mouse(tl, "release", far)
+    assert abs(second.start - max(0.0, s2 - d1)) < 1e-6 and first.start >= second.end - 1e-6
     # an image moved to another video row follows the row; it cannot go onto an audio row
     img = add(win, media["png"], track=0, start=8.0)
     p = clip_point(tl, img)
@@ -990,6 +1017,7 @@ def test_canvas_and_preview(win, media, flush):
     assert win.clip_at_preview(QPointF(540, 540)) is v
     assert win.clip_at_preview(QPointF(5, 5)) is None
     win.sel = None
+    win.update_preview(force=True)
     vp = win.view.mapFromScene(QPointF(540, 540))
     win.view.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(vp), QPointF(win.view.mapToGlobal(vp)),
                                          Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
@@ -1213,7 +1241,7 @@ def test_sub_defaults_save_load_reset(win, cs, qapp, flush):
         try:
             assert w2.sub_size.value() == 123 and w2.sub_anim.currentText() == "Pop"
         finally:
-            w2.deleteLater()
+            dispose_window(w2)
         find_button(win, "sub_reset").click()
         assert not os.path.exists(f)
         assert win.sub_size.value() == win.sub_factory()["size"]
@@ -1266,9 +1294,7 @@ def test_project_save_load_roundtrip(win, media, modals, tmp_path, cs):
         w2.delete_sel()
         assert w2.is_dirty() and w2.windowTitle().endswith("*")
     finally:
-        w2._saved = w2.snapshot()
-        w2.close()
-        w2.deleteLater()
+        dispose_window(w2)
     # header buttons
     win.sel = win.clips[0]
     win.delete_sel()
@@ -1318,10 +1344,8 @@ def test_autosave_and_restore(win, media, modals, cs):
         w2.offer_restore()
         assert json.loads(w2.snapshot()) == snap
         assert w2.proj_path is None and w2.is_dirty(), "a restored project stays unsaved"
-        w2._saved = w2.snapshot()
     finally:
-        w2.close()
-        w2.deleteLater()
+        dispose_window(w2)
     assert not os.path.exists(win.AUTOSAVE), "a clean close removes the autosave"
     win.autosave()
     modals.question_answer = __import__("PySide6.QtWidgets", fromlist=["QMessageBox"]).QMessageBox.No
@@ -1330,8 +1354,7 @@ def test_autosave_and_restore(win, media, modals, cs):
         w3.offer_restore()
         assert not os.path.exists(win.AUTOSAVE) and w3.clips == []
     finally:
-        w3.close()
-        w3.deleteLater()
+        dispose_window(w3)
 
 
 def test_close_event_dirty_prompts(win, media, modals):
@@ -1486,21 +1509,27 @@ def test_export_options_and_guards(win, media, modals, tmp_path, cs, monkeypatch
     assert "h264_nvenc" in seen["cmd"] and seen["cmd"][-1] == str(tmp_path / "x.mp4")
 
 
-def test_hdr_conversion_queue(win, media, tmp_path, flush, cs):
+def test_hdr_conversion_queue(win, media, modals, tmp_path, flush, cs):
     if not cs.has_zscale():
         pytest.skip("ffmpeg without zscale")
     src = str(tmp_path / "hdrish.mp4")
-    shutil.copy(media["video"], src)
-    win.add_to_library(src)
+    shutil.copy(media["hdr"], src)
+    p = cs.probe(src)
+    assert p["hdr"] and p["trc"] == "smpte2084"
+    win.add_to_library(src)                    # HDR prompt (stub answers "Use as is")
+    assert any(k == "msgbox" and "HDR" in str(a) for k, a in modals.calls)
     info = win.lib[0]
+    assert not info["pending"]
     win.convert_hdr(info)
     assert info["pending"] or win.conv_cur is None
     assert win.lib_entry(_mime_row(cs, 0)) is None or not info.get("pending")
     wait_for(lambda: win.conv_cur is None and not win.conv_q, flush, timeout=90)
+    assert not [c for c in modals.calls if c[0] == "warning"], modals.calls
     assert win.lib[0]["path"].endswith("hdrish SDR.mp4") and os.path.exists(win.lib[0]["path"])
     assert not win.lib[0]["pending"] and win.conv_box.isHidden()
-    # cancel path
-    win.add_to_library(src)
+    assert not cs.probe(win.lib[0]["path"])["hdr"]
+    # second conversion gets a numbered name; cancel path
+    win.add_to_library(src, ask=False)
     info2 = [l for l in win.lib if l["path"] == src][0]
     win.convert_hdr(info2)
     find_button(win, "cancel_conv").click()

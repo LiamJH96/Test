@@ -95,13 +95,18 @@ def media(tmp_path_factory):
     wav = str(d / "tone.wav")
     png = str(d / "pic.png")
     _ff("-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=3", "-f", "lavfi", "-i",
-        "sine=frequency=440:duration=3", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "sine=frequency=440:duration=3", "-c:v", "libx264", "-g", "15", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-shortest", vid)
-    _ff("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=2", "-c:v", "libx264", "-preset", "ultrafast",
+    _ff("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=2", "-c:v", "libx264", "-g", "15", "-preset", "ultrafast",
         "-pix_fmt", "yuv420p", vid2)               # no audio track
     _ff("-f", "lavfi", "-i", "sine=frequency=660:duration=2", wav)
     _ff("-f", "lavfi", "-i", "color=c=red:size=200x100", "-frames:v", "1", png)
-    return dict(video=vid, video_noaudio=vid2, wav=wav, png=png, dir=str(d))
+    hdr = str(d / "hdr_clip.mp4")             # 10-bit PQ / BT.2020 tagged -> detected as HDR
+    _ff("-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=1",
+        "-vf", "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,format=yuv420p10le",
+        "-c:v", "libx264", "-preset", "ultrafast", "-color_primaries", "bt2020", "-color_trc", "smpte2084",
+        "-colorspace", "bt2020nc", hdr)
+    return dict(video=vid, video_noaudio=vid2, wav=wav, png=png, hdr=hdr, dir=str(d))
 
 
 # ---------------------------------------------------------------- modal dialogs never block
@@ -147,39 +152,81 @@ def _find_action(m, text):
 
 @pytest.fixture
 def modals(monkeypatch, cs, qapp):
+    """Replace the dialog classes *inside the clip_studio module* with non-blocking Python subclasses.
+
+    (Patching attributes on the Shiboken classes themselves is not reliable, so the module globals are swapped.)
+    """
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import QColorDialog, QFileDialog, QInputDialog, QMenu, QMessageBox
     md = Modals()
     md.question_answer = QMessageBox.Yes
     md.color = QColor("#123456")
 
-    def rec(kind, ret):
-        def f(*a, **k):
-            md.calls.append((kind, a[1:4] if len(a) > 1 else a))
-            return ret() if callable(ret) else ret
-        return staticmethod(f)
+    def rec(kind, args, ret):
+        md.calls.append((kind, args))
+        return ret
 
-    monkeypatch.setattr(QMessageBox, "information", rec("information", QMessageBox.Ok))
-    monkeypatch.setattr(QMessageBox, "warning", rec("warning", QMessageBox.Ok))
-    monkeypatch.setattr(QMessageBox, "critical", rec("critical", QMessageBox.Ok))
-    monkeypatch.setattr(QMessageBox, "question", rec("question", lambda: md.question_answer))
-    monkeypatch.setattr(QMessageBox, "exec", lambda self: md.calls.append(("msgbox", self.text())) or 0)
-    monkeypatch.setattr(QFileDialog, "getSaveFileName", rec("save", lambda: (md.save_path, "")))
-    monkeypatch.setattr(QFileDialog, "getOpenFileName", rec("open", lambda: (md.open_path, "")))
-    monkeypatch.setattr(QFileDialog, "getOpenFileNames", rec("opens", lambda: (list(md.open_paths), "")))
-    monkeypatch.setattr(QInputDialog, "getDouble", rec("getDouble", lambda: md.gap))
-    monkeypatch.setattr(QColorDialog, "getColor", rec("color", lambda: md.color))
+    class FakeMessageBox(QMessageBox):
+        @staticmethod
+        def information(*a, **k):
+            return rec("information", a[1:], QMessageBox.Ok)
 
-    def menu_exec(self, *a, **k):
-        md.menus.append((self, _menu_texts(self)))
-        if md.menu_pick:
-            act = _find_action(self, md.menu_pick)
-            md.menu_pick = None
-            if act:
-                act.trigger()
-                return act
-        return None
-    monkeypatch.setattr(QMenu, "exec", menu_exec)
+        @staticmethod
+        def warning(*a, **k):
+            return rec("warning", a[1:], QMessageBox.Ok)
+
+        @staticmethod
+        def critical(*a, **k):
+            return rec("critical", a[1:], QMessageBox.Ok)
+
+        @staticmethod
+        def question(*a, **k):
+            return rec("question", a[1:], md.question_answer)
+
+        def exec(self):
+            md.calls.append(("msgbox", (self.windowTitle(), self.text())))
+            return 0
+
+        def clickedButton(self):
+            return None
+
+    class FakeFileDialog(QFileDialog):
+        @staticmethod
+        def getSaveFileName(*a, **k):
+            return rec("save", a[1:], (md.save_path, ""))
+
+        @staticmethod
+        def getOpenFileName(*a, **k):
+            return rec("open", a[1:], (md.open_path, ""))
+
+        @staticmethod
+        def getOpenFileNames(*a, **k):
+            return rec("opens", a[1:], (list(md.open_paths), ""))
+
+    class FakeInputDialog(QInputDialog):
+        @staticmethod
+        def getDouble(*a, **k):
+            return rec("getDouble", a[1:], md.gap)
+
+    class FakeColorDialog(QColorDialog):
+        @staticmethod
+        def getColor(*a, **k):
+            return rec("color", a[1:], md.color)
+
+    class FakeMenu(QMenu):
+        def exec(self, *a, **k):
+            md.menus.append((self, _menu_texts(self)))
+            if md.menu_pick:
+                act = _find_action(self, md.menu_pick)
+                md.menu_pick = None
+                if act:
+                    act.trigger()
+                    return act
+            return None
+
+    for name, fake in (("QMessageBox", FakeMessageBox), ("QFileDialog", FakeFileDialog),
+                       ("QInputDialog", FakeInputDialog), ("QColorDialog", FakeColorDialog), ("QMenu", FakeMenu)):
+        monkeypatch.setattr(cs, name, fake)
     return md
 
 
@@ -198,23 +245,40 @@ def flush(qapp):
     return lambda ms=0: _flush(qapp, ms)
 
 
+def dispose_window(w):
+    """Close a MainWindow without prompts and tear it down so late background signals cannot reach it."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance()
+    try:
+        w.playing = False
+        w.timer.stop()
+        w.auto_timer.stop()
+        w._saved = w.snapshot()       # not dirty -> closeEvent does not ask to save
+        w.close()
+    except RuntimeError:
+        return
+    for sig, slot in ((CS.BUS.wave, w.tl._invalidate), (CS.BUS.prog, w.on_prog), (CS.BUS.done, w.on_export_done),
+                      (CS.BUS.conv, w.on_conv_prog), (CS.BUS.convdone, w.on_conv_done)):
+        try:
+            sig.disconnect(slot)
+        except (RuntimeError, TypeError):
+            pass
+    w.deleteLater()
+    app.sendPostedEvents(None, QEvent.DeferredDelete)
+    _flush(app)
+
+
 @pytest.fixture
 def win(cs, qapp, modals):
     """A fresh, shown MainWindow. Never leaves modal dialogs or autosave files behind."""
-    from PySide6.QtCore import QEvent
     w = cs.MainWindow()
     w.auto_timer.stop()
     w.show()
     _flush(qapp)
     yield w
-    w.playing = False
-    w.timer.stop()
-    w._saved = w.snapshot()       # not dirty -> closeEvent does not ask to save
-    w.close()
-    w.deleteLater()
-    qapp.sendPostedEvents(None, QEvent.DeferredDelete)
-    _flush(qapp)
+    dispose_window(w)
     try:
-        os.remove(w.AUTOSAVE)
+        os.remove(cs.MainWindow.AUTOSAVE)
     except OSError:
         pass
