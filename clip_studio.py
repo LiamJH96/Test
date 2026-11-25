@@ -289,7 +289,7 @@ def regular_only(fam):
 
 def eff_bold(c):
     """Caption text weight 0-100. Automatic: a heavy look when only a Regular weight is installed."""
-    return int(c.cbold) if c.cbold >= 0 else (50 if regular_only(c.cfont) else 0)
+    return int(c.cbold) if c.cbold >= 0 else (20 if regular_only(c.cfont) else 0)
 
 
 def caption_layout(text, size, fam, bold=0):
@@ -306,7 +306,7 @@ def caption_layout(text, size, fam, bold=0):
     maxw = 1080 * 0.84 - 2 * pad
     lines = []
     for para in text.split("\n"):
-        cur, curw = [], 0.0
+        toks = []   # (pieces, width); an emoji never gets a line of its own, it stays with the word before it
         for chunk in para.split():
             pieces, pos = [], 0
             for m in EMOJI_RE.finditer(chunk):
@@ -317,16 +317,49 @@ def caption_layout(text, size, fam, bold=0):
             if pos < len(chunk):
                 pieces.append(("t", chunk[pos:]))
             pw = sum(fm.horizontalAdvance(v) if k == "t" else emw for k, v in pieces)
-            if cur and curw + sp + pw > maxw:
-                lines.append((cur, curw))
-                cur, curw = [], 0.0
-            if cur:
-                cur.append(("t", " "))
-                curw += sp
-            cur += pieces
-            curw += pw
-        if cur:
-            lines.append((cur, curw))
+            if toks and all(k == "e" for k, _ in pieces):
+                toks[-1] = (toks[-1][0] + [("t", " ")] + pieces, toks[-1][1] + sp + pw)
+            else:
+                toks.append((pieces, pw))
+        if not toks:
+            continue
+        n = len(toks)
+
+        def span(i, j):
+            return sum(t[1] for t in toks[i:j]) + sp * (j - i - 1)
+
+        cnt, curw = 1, 0.0
+        for i, t in enumerate(toks):   # fewest lines possible
+            if i and curw + sp + t[1] > maxw:
+                cnt, curw = cnt + 1, t[1]
+            else:
+                curw += (sp if i else 0) + t[1]
+        INF = float("inf")
+        best = [[INF] * (n + 1) for _ in range(cnt + 1)]
+        prev = [[0] * (n + 1) for _ in range(cnt + 1)]
+        best[0][0] = 0.0
+        for k in range(1, cnt + 1):    # spread the words so the lines come out even
+            for j in range(1, n + 1):
+                for i in range(j - 1, -1, -1):
+                    w = span(i, j)
+                    if w > maxw and j - i > 1:
+                        break
+                    if best[k - 1][i] == INF:
+                        continue
+                    cost = best[k - 1][i] + (maxw - w) ** 2
+                    if cost < best[k][j]:
+                        best[k][j], prev[k][j] = cost, i
+        cuts, j = [], n
+        for k in range(cnt, 0, -1):
+            cuts.append((prev[k][j], j))
+            j = prev[k][j]
+        for i, j in reversed(cuts):
+            cur = []
+            for t in toks[i:j]:
+                if cur:
+                    cur.append(("t", " "))
+                cur += t[0]
+            lines.append((cur, span(i, j)))
     return font, fm, emw, pad, lines
 
 
@@ -335,13 +368,13 @@ def render_caption(c):
     size = max(12, int(c.csize))
     text = c.text.strip() or " "
     bold = eff_bold(c)
-    key = hashlib.md5(f"{text}|{size}|{c.cfont}|{c.ccol}|{c.cbox}|{int(c.cuse)}|{bold}|v8".encode()).hexdigest()[:16]
+    key = hashlib.md5(f"{text}|{size}|{c.cfont}|{c.ccol}|{c.cbox}|{int(c.cuse)}|{bold}|v9".encode()).hexdigest()[:16]
     os.makedirs(CAP_DIR, exist_ok=True)
     fp = os.path.join(CAP_DIR, key + ".png")
     font, fm, emw, pad, lines = caption_layout(text, size, c.cfont, bold)
     if not lines:
         lines = [([("t", " ")], 0.0)]
-    lh = size * 1.3
+    lh = size * 1.24
     boxw = [w + 2 * pad for _, w in lines]
     W, H = int(math.ceil(max(boxw))) + 8, int(math.ceil(lh * len(lines))) + 8
     if not os.path.exists(fp):
@@ -353,8 +386,9 @@ def render_caption(c):
         if c.cuse:
             # one merged shape: outer corners rounded, where a narrower line meets a wider one the sides run
             # straight into it (no curve), exactly like CapCut's label captions
-            rad = size * 0.2
+            rad = size * 0.3
             path = QPainterPath()
+            fillets = []
             for i, bw in enumerate(boxw):
                 top, bot = 4 + i * lh, 4 + (i + 1) * lh
                 if i > 0 and boxw[i - 1] >= bw - 0.5:
@@ -364,9 +398,27 @@ def render_caption(c):
                 q = QPainterPath()
                 q.addRoundedRect(QRectF((W - bw) / 2, top, bw, bot - top), rad, rad)
                 path = q if i == 0 else path.united(q)
+            for i in range(len(boxw) - 1):   # soft inner corners where the line width changes
+                Y = 4 + (i + 1) * lh
+                wide, nar = max(boxw[i], boxw[i + 1]), min(boxw[i], boxw[i + 1])
+                step = (wide - nar) / 2
+                if step < 1:
+                    continue
+                f = min(rad, step)
+                up = boxw[i] < boxw[i + 1]     # narrower line is the upper one
+                for sx in (-1, 1):
+                    cx = W / 2 + sx * nar / 2
+                    cy2 = Y - f if up else Y + f
+                    sq = QPainterPath()
+                    sq.addRect(QRectF(cx if sx > 0 else cx - f, min(Y, cy2), f, f))
+                    ci = QPainterPath()
+                    ci.addEllipse(QPointF(cx + sx * f, cy2), f, f)
+                    fillets.append(sq.subtracted(ci))
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(c.cbox))
             p.drawPath(path)
+            for fp_ in fillets:
+                p.drawPath(fp_)
         faux = bold > 0
         emo_font = QFont("Segoe UI Emoji")
         emo_font.setPixelSize(int(size * 0.9))
