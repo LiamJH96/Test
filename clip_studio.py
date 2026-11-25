@@ -75,13 +75,15 @@ def probe(path):
 
 
 _amix_norm = None
+_caps_lock = threading.Lock()      # the two ffmpeg capability checks below may run on a warm-up thread
 
 
 def amix_has_normalize():
     global _amix_norm
-    if _amix_norm is None:
-        _amix_norm = "normalize" in run([FFMPEG, "-hide_banner", "-h", "filter=amix"]).stdout
-    return _amix_norm
+    with _caps_lock:
+        if _amix_norm is None:
+            _amix_norm = "normalize" in run([FFMPEG, "-hide_banner", "-h", "filter=amix"]).stdout
+        return _amix_norm
 
 
 WAVES = {}  # path -> numpy peaks, 100 bins/sec
@@ -104,9 +106,22 @@ _has_zscale = None
 
 def has_zscale():
     global _has_zscale
-    if _has_zscale is None:
-        _has_zscale = " zscale " in run([FFMPEG, "-hide_banner", "-filters"]).stdout
-    return _has_zscale
+    with _caps_lock:
+        if _has_zscale is None:
+            _has_zscale = " zscale " in run([FFMPEG, "-hide_banner", "-filters"]).stdout
+        return _has_zscale
+
+
+def warm_ffmpeg_caps():
+    """Ask ffmpeg about its filters in the background at start-up, so the first export doesn't wait for it.
+    The functions still work lazily if this hasn't finished (they then wait for the lock or run the check)."""
+    def work():
+        try:
+            amix_has_normalize()
+            has_zscale()
+        except Exception as e:
+            store.log_error("Checking ffmpeg's filters failed", e)
+    threading.Thread(target=work, name="ffmpeg-caps", daemon=True).start()
 
 
 def hdr_filter(trc):
@@ -6105,6 +6120,7 @@ class MainWindow(QMainWindow):
         self.prog.setWindowModality(Qt.WindowModal)
         self.prog.canceled.connect(lambda: setattr(self, "cancel_flag", True))
         self.prog.show()
+        self._exporting = True                       # this window started it: only it reacts when it ends
         threading.Thread(target=self.run_export, args=(cmd, T), daemon=True).start()
 
     def run_export(self, cmd, T):
@@ -6141,6 +6157,9 @@ class MainWindow(QMainWindow):
                                    f"{int(f * 100)}%{left}")
 
     def on_export_done(self, err):
+        if not getattr(self, "_exporting", False):     # another window's export (BUS is shared)
+            return
+        self._exporting = False
         if self.prog:
             self.prog.close()
             self.prog = None
@@ -6542,6 +6561,7 @@ def main():
         sys.__excepthook__(et, ev, tb)
     sys.excepthook = _log_err
     dark_theme(app)
+    warm_ffmpeg_caps()
     w = MainWindow()
     w.track_session = True
     w.unclean_sessions = store.acquire_session_lock()     # earlier sessions that crashed
