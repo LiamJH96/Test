@@ -1588,7 +1588,8 @@ class Timeline(QWidget):
             p.setBrush(Qt.NoBrush)
             if sel:
                 p.fillPath(path, self.c_lift)
-                p.setPen(self.pen_sel)
+                primary = c is self.win.sel or len(self.win._sels) < 2      # the primary clip stays solid
+                p.setPen(self.pen_sel if primary else QPen(QColor(242, 243, 245, 150), 1.5))
                 p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 4, 4)
             else:
                 p.setPen(self.pen_hov if c is self.hov else QPen(edge, 1))
@@ -2115,8 +2116,21 @@ class LibraryList(QListWidget):
         self.setDragEnabled(False)          # we start drags ourselves (more reliable than Qt's own)
         self.setDragDropMode(QListWidget.NoDragDrop)
         self.setObjectName("library")
+        self.setTextElideMode(Qt.ElideMiddle)
         self._press = None
         self._drag = None
+
+    def resizeEvent(self, ev):
+        """As many columns as fit (at least 124 px each), thumbnails 16:9, room for a two-line name."""
+        super().resizeEvent(ev)
+        vw = self.viewport().width() - 2 * 4
+        cols = max(1, vw // 124)
+        cell = max(100, vw // cols)
+        iw = cell - 12
+        ih = int(iw * 9 / 16)
+        if self.iconSize() != QSize(iw, ih):
+            self.setIconSize(QSize(iw, ih))
+            self.setGridSize(QSize(cell, ih + 12 + 34))
 
     def mousePressEvent(self, ev):
         super().mousePressEvent(ev)
@@ -2129,18 +2143,36 @@ class LibraryList(QListWidget):
         w = self.window()
         try:
             e = w.lib[self.row(it)]
-            return None if e.get("pending") else e
+            return None if e.get("pending") or e.get("missing") else e
         except Exception:
             return None
 
+    def _end_drag(self):
+        lib, ghost = self._drag
+        self._drag = None
+        ghost.hide()
+        ghost.deleteLater()
+        self.viewport().releaseMouse()
+        self.releaseKeyboard()
+        self.unsetCursor()
+        return lib
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key_Escape and getattr(self, "_drag", None):     # cancel the drag: nothing is added
+            self._end_drag()
+            tl = self.window().tl
+            tl.drop_hint = None
+            tl._auto.stop()
+            tl.update()
+            return
+        if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace) and ev.modifiers() == Qt.NoModifier:
+            self.window().delete_lib_selected()
+            return
+        super().keyPressEvent(ev)
+
     def mouseReleaseEvent(self, ev):
         if getattr(self, "_drag", None):
-            lib, ghost = self._drag
-            self._drag = None
-            ghost.hide()
-            ghost.deleteLater()
-            self.viewport().releaseMouse()
-            self.unsetCursor()
+            lib = self._end_drag()
             self.window().tl.ext_drop(lib, ev.globalPosition().toPoint())
             return
         self._press = None
@@ -2171,6 +2203,7 @@ class LibraryList(QListWidget):
                 ghost.show()
                 self._drag = (lib, ghost)
                 self.viewport().grabMouse()
+                self.grabKeyboard()                     # so Esc reaches us and can cancel
                 self.setCursor(Qt.ClosedHandCursor)
                 return
         super().mouseMoveEvent(ev)
@@ -2446,7 +2479,10 @@ class TransformBox(QGraphicsItem):
         return QRectF(cx - w / 2, cy - h / 2, w, h)
 
     def hs(self):
-        return 14 / max(self.win.view.transform().m11(), 0.01)
+        try:
+            return 14 / max(self.win.view.transform().m11(), 0.01)
+        except RuntimeError:                 # the window is being torn down
+            return 14.0
 
     def boundingRect(self):
         if not self.c:
@@ -2668,7 +2704,7 @@ PROJECT_KEYS = ("substyle", "W", "H", "lib", "clips")      # what project_dict()
 class ElideButton(QPushButton):
     """A push button whose text is elided to fit, so a long project name never widens the window.
     Its minimum is a fixed 80 px; it asks for the full text width up to maximumWidth()."""
-    PAD = 44                      # padding + chevron icon + spacing
+    PAD = 38                      # padding + chevron icon + spacing + border
 
     def __init__(self, text=""):
         super().__init__(text)
@@ -2686,7 +2722,8 @@ class ElideButton(QPushButton):
 
     def sizeHint(self):
         sh = super().sizeHint()
-        return QSize(min(self.maximumWidth(), self._bold_metrics().horizontalAdvance(self.full) + self.PAD), sh.height())
+        return QSize(min(self.maximumWidth(), self._bold_metrics().horizontalAdvance(self.full) + self.PAD),
+                     sh.height())
 
     def minimumSizeHint(self):
         return QSize(80, super().minimumSizeHint().height())
@@ -2699,6 +2736,12 @@ class ElideButton(QPushButton):
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         self._elide()
+
+    def changeEvent(self, ev):
+        super().changeEvent(ev)
+        if ev.type() in (ev.Type.FontChange, ev.Type.StyleChange):    # the stylesheet font arrives late
+            self.updateGeometry()
+            self._elide()
 
 
 class Relay(QObject):
@@ -2776,6 +2819,8 @@ class MainWindow(QMainWindow):
         self.libview.setContextMenuPolicy(Qt.CustomContextMenu)
         self.libview.customContextMenuRequested.connect(self.lib_menu)
         b_imp = QPushButton("Import media")
+        b_imp.setToolTip("Import video, pictures and audio files")
+        b_imp.setStyleSheet("padding: 4px 6px;")      # fits the narrowest panel
         b_imp.clicked.connect(self.import_media)
         b_add = QPushButton("Add to timeline")
         b_add.clicked.connect(self.add_selected_lib)
@@ -2805,11 +2850,11 @@ class MainWindow(QMainWindow):
         self.conv_box.hide()
         ll.addWidget(self.conv_box)
         b_imp.setIcon(mk_icon("plus", "#C9CBD1"))
-        b_imp.setIconSize(QSize(16, 16))
+        b_imp.setIconSize(QSize(14, 14))
         lr = QHBoxLayout()
         lr.setSpacing(8)
-        lr.addWidget(b_imp)
-        lr.addWidget(b_add)
+        lr.addWidget(b_imp, 1)
+        lr.addWidget(b_add, 1)
         ll.addLayout(lr)
         tr_w = QWidget()
         tl_ = QVBoxLayout(tr_w)
@@ -2998,6 +3043,14 @@ class MainWindow(QMainWindow):
                 cb.setItemDelegate(QStyledItemDelegate(cb))
         self.fit_header(self.width())
         self.load_props()                            # inspector starts in its "no clip selected" state
+        self._saved_meta = self.meta_doc()
+        self._undo_ready = True
+        # keys a focused control needs for itself must reach it instead of the window's shortcuts
+        from PySide6.QtWidgets import QAbstractSlider, QAbstractButton, QAbstractItemView
+        self._key_widgets = (QAbstractSlider, QComboBox, QAbstractButton, QAbstractItemView)
+        for wdg in self.editor_page.findChildren(QWidget):
+            if isinstance(wdg, self._key_widgets):
+                wdg.installEventFilter(self)
 
     # ------------------------------------------------------------------ misc UI
     def status(self, msg, ms=6000):
@@ -3143,27 +3196,27 @@ class MainWindow(QMainWindow):
         self.cb_canvas.setMinimumWidth(170)
         self.cb_canvas.currentTextChanged.connect(self.set_canvas)
         self.lbl_canvas = field("Canvas")
-        self.lbl_canvas.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)   # never adds to the minimum
+        self.lbl_canvas.setMinimumWidth(1)          # never adds to the window's minimum width
         hd.addWidget(self.lbl_canvas)
         hd.addWidget(self.cb_canvas)
-        hd.addSpacing(12)
+        hd.addSpacing(8)
         self.cb_fps = QComboBox()
         self.cb_fps.addItems(["30", "60"])
         self.cb_fps.setToolTip("Frame rate of the exported video")
         self.cb_fps.setFixedWidth(72)
         self.lbl_fps = field("Frame rate")
-        self.lbl_fps.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_fps.setMinimumWidth(1)          # never adds to the window's minimum width
         hd.addWidget(self.lbl_fps)
         hd.addWidget(self.cb_fps)
-        hd.addSpacing(12)
+        hd.addSpacing(8)
         hd.addWidget(sep())
         hd.addSpacing(4)
         self.ck_nv = QCheckBox("GPU (NVENC)")
         self.ck_nv.setToolTip("Faster export on NVIDIA graphics cards")
         hd.addWidget(self.ck_nv)
-        hd.addSpacing(12)
+        hd.addSpacing(8)
         b_exp = btn("Export video", "Render the finished video to an MP4 file", self.export, "primary")
-        b_exp.setMinimumWidth(112)
+        b_exp.setMinimumWidth(122)
         b_exp.setIcon(mk_icon("export", "#FFFFFF"))
         b_exp.setIconSize(QSize(16, 16))
         hd.addWidget(b_exp)
@@ -3277,8 +3330,6 @@ class MainWindow(QMainWindow):
         self.b_proj.setMaximumWidth(200 if narrow else 320)
         for lab in (self.lbl_canvas, self.lbl_fps):
             lab.setVisible(not narrow)
-            if not narrow:
-                lab.setMinimumWidth(lab.sizeHint().width())
 
     def showEvent(self, ev):
         super().showEvent(ev)
@@ -3292,8 +3343,13 @@ class MainWindow(QMainWindow):
         self.view.fit()
 
     def set_canvas(self, name):
+        if (self.W, self.H) == CANVAS[name]:
+            return
+        if not self._opening and not getattr(self, "_restoring", False) and getattr(self, "_undo_ready", False):
+            self.push_undo()                          # the canvas size is part of undo
         self.W, self.H = CANVAS[name]
         self.build_canvas()
+        self.update_title()
 
     def build_props(self):
         def ss(lo, hi, step, suffix="", dec=2):
@@ -3455,10 +3511,12 @@ class MainWindow(QMainWindow):
         self.cap_bold.valueChanged.connect(lambda *_: self.apply_caption())
         self.cap_box = QCheckBox("White label boxes")
         self.cap_box.toggled.connect(lambda *_: self.apply_caption())
-        self.cap_bcol = QPushButton("Box colour")
-        self.cap_tcol = QPushButton("Text colour")
-        self.cap_bcol.clicked.connect(lambda: self.pick_cap_colour("cbox"))
-        self.cap_tcol.clicked.connect(lambda: self.pick_cap_colour("ccol"))
+        self.cap_bcol = ColorButton("#FFFFFF")          # same colour control as the subtitle look
+        self.cap_tcol = ColorButton("#000000")
+        self.cap_bcol.setToolTip("Box colour")
+        self.cap_tcol.setToolTip("Text colour")
+        self.cap_bcol.changed.connect(lambda: self.set_cap_colour("cbox", self.cap_bcol.color))
+        self.cap_tcol.changed.connect(lambda: self.set_cap_colour("ccol", self.cap_tcol.color))
         b_font = QPushButton("Load font file...")
         b_font.setToolTip("Add a font from a .ttf / .otf file (e.g. Montserrat or Proxima Nova)")
         b_font.clicked.connect(self.load_font)
@@ -3470,11 +3528,8 @@ class MainWindow(QMainWindow):
         f.addRow("Size", self.cap_size)
         f.addRow("Boldness", self.cap_bold)
         f.addRow(self.cap_box)
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        row.addWidget(self.cap_bcol)
-        row.addWidget(self.cap_tcol)
-        f.addRow(row)
+        f.addRow("Box", self.cap_bcol)
+        f.addRow("Text", self.cap_tcol)
         v.addLayout(f)
         n = QLabel("Each line gets its own box that hugs the text. Press Enter for a new line. Drag the caption in "
                    "the preview to move it.")
@@ -3727,6 +3782,20 @@ class MainWindow(QMainWindow):
                     anim=self.sub_anim.currentText(), tag_anim=self.sub_tag_anim.currentText(), anim_ms=self.sub_anim_ms.value(), upper=self.sub_upper.isChecked())
 
     def apply_sub_style(self, d):
+        """Set the whole subtitle look at once (one undo step when the user does it)."""
+        if hasattr(self, "sub_anim_ms") and d == self.sub_style():
+            return
+        quiet = getattr(self, "_restoring", False)
+        if not quiet and not self._opening:
+            self.push_undo_for(("substyle-all",))
+        self._restoring = True
+        try:
+            self._apply_sub_style(d)
+        finally:
+            self._restoring = quiet
+        self.sub_changed()
+
+    def _apply_sub_style(self, d):
         try:
             self.sub_font.setCurrentFont(QFont(d["font"]))
             self.sub_bold.setChecked(d["bold"])
@@ -3747,6 +3816,8 @@ class MainWindow(QMainWindow):
             pass
 
     def sub_changed(self):
+        if not self._opening and not getattr(self, "_restoring", False):
+            self.push_undo_for(("substyle", id(self.sender())))
         if getattr(self, "subitem", None) is not None:
             self.subitem.update()
 
@@ -3799,8 +3870,7 @@ class MainWindow(QMainWindow):
         toks = self.sub_edit.toPlainText().split()
         if not toks:
             return
-        if time.time() - self.last_push > 0.8:
-            self.push_undo()
+        self.push_undo_for(("subtext", c.id))
         if len(toks) == len(c.words):
             for w, t in zip(c.words, toks):
                 w[0] = t
@@ -3894,6 +3964,16 @@ class MainWindow(QMainWindow):
         self.after_edit()
         self.status(f"Done: {n} subtitles added across the timeline. Press Space to play and check them.")
 
+    def set_cap_colour(self, attr, col):
+        c = self.sel
+        if self._loading or not c or not c.nat or getattr(c, attr).lower() == col.lower():
+            return
+        self.push_undo()
+        setattr(c, attr, col.lower())
+        self.rerender_caption(c)
+        self.load_props()
+        self.after_edit()
+
     def pick_cap_colour(self, attr):
         c = self.sel
         if not c or not c.nat:
@@ -3915,8 +3995,7 @@ class MainWindow(QMainWindow):
         c = self.sel
         if self._loading or not c or not c.nat:
             return
-        if time.time() - self.last_push > 0.8:
-            self.push_undo()
+        self.push_undo_for(("caption", c.id, id(self.sender())))
         c.text = self.cap_edit.toPlainText()
         c.cfont = self.cap_font.currentFont().family()
         c.csize = int(self.cap_size.value())
@@ -3932,13 +4011,21 @@ class MainWindow(QMainWindow):
         c = Clip(kind="image", track=1, start=self.t, dur=3.0, srcdur=BIG, nat=1, text=text, y=-30.0,
                  cfont=default_font())
         self.rerender_caption(c)
-        while self.tl.overlaps(c, c.track, c.start, c.dur):
-            c.start = max(o.end for o in self.clips if o.track == c.track and c.start < o.end and o.start < c.start + c.dur)
+        free = [tr for tr in (1, 0) if not self.tl.overlaps(c, tr, c.start, c.dur)]
+        if free:                                     # at the playhead: Overlay 1, else Overlay 2
+            c.track = free[0]
+        else:
+            while self.tl.overlaps(c, c.track, c.start, c.dur):
+                c.start = max(o.end for o in self.clips if o.track == c.track and c.start < o.end
+                              and o.start < c.start + c.dur)
+            self.status(f"Both overlay tracks are busy at the playhead, so the caption went to {fmt_t(c.start)}.")
         self.clips.append(c)
         self.sel = c
         self.load_props()
         self.after_edit()
-        self.status("Caption added. Edit it in the Caption tab, drag it in the preview, drag its edges to change timing.")
+        if free:
+            self.status("Caption added. Edit it in the Caption tab, drag it in the preview, drag its edges to change "
+                        "timing.")
 
     def load_props(self):
         c = self.sel
@@ -3959,8 +4046,8 @@ class MainWindow(QMainWindow):
                 self.cap_size.setValue(c.csize)
                 self.cap_bold.setValue(eff_bold(c))
                 self.cap_box.setChecked(c.cuse)
-                self.cap_bcol.setIcon(swatch_icon(c.cbox))
-                self.cap_tcol.setIcon(swatch_icon(c.ccol))
+                self.cap_bcol.set_color(c.cbox.upper())
+                self.cap_tcol.set_color(c.ccol.upper())
             issub = bool(c and c.kind == "sub")
             if not issub and self.sub_edit.toPlainText():
                 self.sub_edit.blockSignals(True)
@@ -4042,8 +4129,7 @@ class MainWindow(QMainWindow):
         c = self.sel
         if self._loading or not c:
             return
-        if time.time() - self.last_push > 0.8:
-            self.push_undo()
+        self.push_undo_for(("props", c.id, id(self.sender())))
         c.fin = min(self.p_fin.value(), c.dur)
         c.fout = min(self.p_fout.value(), c.dur)
         c.vol, c.scale = self.p_vol.value(), self.p_scale.value()
@@ -4078,7 +4164,7 @@ class MainWindow(QMainWindow):
     def lib_entry(self, mime):
         try:
             e = self.lib[int(bytes(mime.data(MIME)).decode())]
-            return None if e.get("pending") else e
+            return None if e.get("pending") or e.get("missing") else e
         except Exception:
             return None
 
@@ -4089,16 +4175,43 @@ class MainWindow(QMainWindow):
         for f in files:
             self.add_to_library(f)
 
-    def make_icon(self, info):
-        pm = QPixmap()
+    @staticmethod
+    def icon_image(info):
+        """The library picture as a QImage (safe to make on a worker thread), or a null image."""
+        img = QImage()
         path = info["path"]
         if info["kind"] == "image":
-            pm = QPixmap(path)
+            img = QImage(path)
         elif info["kind"] == "video":
             tmp = os.path.join(tempfile.gettempdir(), f"cs_{uuid.uuid4().hex[:8]}.png")
             run([FFMPEG, "-y", "-v", "error", "-ss", str(min(1.0, info["dur"] / 2)), "-i", path, "-frames:v", "1",
                  "-vf", "scale=240:-2", tmp])
-            pm = QPixmap(tmp)
+            img = QImage(tmp)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if not img.isNull():
+            img = img.scaled(240, 136, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return img
+
+    def placeholder_icon(self, info, offline=False):
+        pm = QPixmap(120, 68)
+        if info.get("kind") == "audio" and not offline:
+            pm.fill(QColor(TRACK_STYLE["audio"][0]))
+            p = QPainter(pm)
+            p.drawPixmap(48, 22, mk_icon("audio", TRACK_STYLE["audio"][3], 24).pixmap(24, 24))
+            p.end()
+        else:
+            pm.fill(QColor("#2A2B30"))
+            if offline:
+                p = QPainter(pm)
+                p.drawPixmap(48, 22, mk_icon("warn", "#E2A33B", 24).pixmap(24, 24))
+                p.end()
+        return QIcon(pm)
+
+    def make_icon(self, info):
+        pm = QPixmap.fromImage(self.icon_image(info))
         if pm.isNull():
             pm = QPixmap(120, 68)
             if info["kind"] == "audio":
@@ -4117,16 +4230,24 @@ class MainWindow(QMainWindow):
         if info["kind"] == "video":
             threading.Thread(target=compute_thumbs, args=(path, info["dur"]), daemon=True).start()
 
-    def add_to_library(self, path, ask=True):
+    def add_to_library(self, path, ask=True, known=None):
+        """Import a file. known: the entry stored in a project (its details are trusted, no re-probing)."""
         if any(l["path"] == path for l in self.lib):
             return
-        info = probe(path)
+        if known and all(k in known for k in ("kind", "dur", "w", "h", "hasaudio")):
+            info = dict(known)
+            info.setdefault("hdr", False)
+            info.setdefault("trc", "")
+        else:
+            info = probe(path)
         info["path"], info["name"], info["pending"] = path, os.path.basename(path), False
+        info.pop("missing", None)
         self.lib.append(info)
         it = QListWidgetItem(info["name"])
-        it.setIcon(self.make_icon(info))
+        it.setIcon(self.placeholder_icon(info))        # the real picture follows from a worker thread
         it.setToolTip(path)
         self.libview.addItem(it)
+        self._load_icon(info)
         if info["hdr"] and ask:
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Question)
@@ -4146,6 +4267,104 @@ class MainWindow(QMainWindow):
             self.start_bg(info)
         self.status(f"Imported {info['name']}")
 
+    def _load_icon(self, info):
+        if info["kind"] == "audio":
+            return
+
+        def work():
+            img = self.icon_image(info)
+            if not img.isNull():
+                self._post(lambda: self._set_lib_icon(info, img))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_lib_icon(self, info, img):
+        if info in self.lib:
+            it = self.libview.item(self.lib.index(info))
+            if it is not None:
+                it.setIcon(QIcon(QPixmap.fromImage(img).scaled(120, 68, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+
+    def add_offline_lib(self, entry):
+        """A library entry whose file can't be found: kept (and saved) so nothing is lost; shown greyed."""
+        info = dict(entry)
+        info["missing"] = True
+        info.setdefault("name", os.path.basename(info["path"]))
+        info["pending"] = False
+        self.lib.append(info)
+        it = QListWidgetItem(info["name"] + "\n(offline)")
+        it.setIcon(self.placeholder_icon(info, offline=True))
+        it.setForeground(QColor("#767880"))
+        it.setToolTip(f"File not found:\n{info['path']}\nRight-click and choose Locate file\u2026 to find it.")
+        self.libview.addItem(it)
+
+    def delete_lib_selected(self):
+        """Delete key in the Library: remove the selected item from the library (never from the timeline)."""
+        r = self.libview.currentRow()
+        if not 0 <= r < len(self.lib):
+            return
+        info = self.lib[r]
+        if info.get("pending"):
+            return
+        if any(c.path == info["path"] for c in self.clips):
+            self.status(f"\u201c{info['name']}\u201d is used on the timeline, so it stays in the library.")
+            return
+        self.remove_lib(info)
+        self.status(f"Removed {info['name']} from the library.")
+
+    def missing_paths(self):
+        paths = {l["path"] for l in self.lib if l.get("missing")}
+        paths |= {c.path for c in self.clips if not c.nat and c.kind != "sub" and c.path and not os.path.exists(c.path)}
+        return sorted(paths)
+
+    def locate_file(self, old):
+        """Let the user find a moved file; every clip and library entry using it is relinked. Other missing files
+        found in the same folder are offered too."""
+        name = os.path.basename(old)
+        ext = os.path.splitext(name)[1]
+        p, _ = QFileDialog.getOpenFileName(self, f"Locate {name}", os.path.dirname(old) if os.path.isdir(
+            os.path.dirname(old)) else "", f"{name} (*{ext});;All files (*)")
+        if not p:
+            return False
+        n = self.relink({old: p})
+        folder = os.path.dirname(p)
+        more = {m: os.path.join(folder, os.path.basename(m)) for m in self.missing_paths()
+                if os.path.isfile(os.path.join(folder, os.path.basename(m)))}
+        if more and QMessageBox.question(
+                self, "Locate files", f"{len(more)} more missing file(s) were found in the same folder. "
+                "Use them too?", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes:
+            n += self.relink(more)
+        self.status(f"Relinked {n} item(s).")
+        return True
+
+    def relink(self, mapping):
+        """{old path: new path}: point clips and library entries at the new files. Returns how many changed."""
+        n = 0
+        self.push_undo()
+        for c in self.clips:
+            new = mapping.get(c.path)
+            if new:
+                if c.name == os.path.basename(c.path):
+                    c.name = os.path.basename(new)
+                c.path = new
+                n += 1
+                if c.hasaudio and c.kind in ("audio", "video"):
+                    threading.Thread(target=compute_wave, args=(new,), daemon=True).start()
+        for old, new in mapping.items():
+            row = next((i for i, l in enumerate(self.lib) if l["path"] == old), None)
+            if row is None:
+                continue
+            known = {k: v for k, v in self.lib[row].items() if k != "missing"}
+            self.lib.pop(row)
+            self.libview.takeItem(row)
+            if any(l["path"] == new for l in self.lib):
+                continue
+            self.add_to_library(new, ask=False, known=known if os.path.getsize(new) == known.get("size", -1) else None)
+            self.lib.insert(row, self.lib.pop())                  # keep the row where it was
+            self.libview.insertItem(row, self.libview.takeItem(self.libview.count() - 1))
+            self.start_bg(self.lib[row])
+            n += 1
+        self.after_edit()
+        return n
+
     # ---- HDR -> SDR conversion (same filter chain as the standalone HDR-to-SDR script)
     def lib_menu(self, pos):
         it = self.libview.itemAt(pos)
@@ -4153,8 +4372,11 @@ class MainWindow(QMainWindow):
             return
         info = self.lib[self.libview.row(it)]
         m = QMenu(self)
+        if info.get("missing"):
+            m.addAction("Locate file\u2026", lambda: self.locate_file(info["path"]))
+            m.addSeparator()
         a = m.addAction("Convert HDR to SDR...", lambda: self.convert_hdr(info))
-        a.setEnabled(info["kind"] == "video" and not info.get("pending"))
+        a.setEnabled(info["kind"] == "video" and not info.get("pending") and not info.get("missing"))
         used = any(c.path == info["path"] for c in self.clips)
         r = m.addAction("Remove from library" + ("  (in use on the timeline)" if used else ""),
                         lambda: self.remove_lib(info))
@@ -4292,6 +4514,9 @@ class MainWindow(QMainWindow):
             if self.lib[r].get("pending"):
                 self.status("That clip is still converting to SDR - it'll be available when the bar finishes.")
                 return
+            if self.lib[r].get("missing"):
+                self.status("That file can't be found. Right-click it and choose Locate file\u2026")
+                return
             self.add_clip(self.lib[r], None, None)
 
     def add_selected_lib(self):
@@ -4374,27 +4599,68 @@ class MainWindow(QMainWindow):
     def snapshot(self):
         return json.dumps([c.to_dict() for c in self.clips])
 
+    def undo_state(self):
+        """What an undo step holds: the clips plus the canvas size and the subtitle look."""
+        return json.dumps({"clips": [c.to_dict() for c in self.clips], "W": self.W, "H": self.H,
+                           "sub": self.sub_style()})
+
     def restore(self, s):
-        self.clips = [Clip(**d) for d in json.loads(s)]
-        self.sel = None
+        """Go back to an undo state (or a plain clip snapshot). The selection is kept for clips that still exist."""
+        d = json.loads(s)
+        ids = [c.id for c in self.selected()]
+        prim = self.sel.id if self.sel is not None else None
+        self._restoring = True
+        try:
+            if isinstance(d, dict):
+                if (d.get("W"), d.get("H")) != (self.W, self.H) and d.get("W") and d.get("H"):
+                    self.W, self.H = int(d["W"]), int(d["H"])
+                    for name, wh in CANVAS.items():
+                        if wh == (self.W, self.H):
+                            self.cb_canvas.blockSignals(True)
+                            self.cb_canvas.setCurrentText(name)
+                            self.cb_canvas.blockSignals(False)
+                    self.build_canvas()
+                if d.get("sub") and d["sub"] != self.sub_style():
+                    self.apply_sub_style(d["sub"])
+                d = d.get("clips", [])
+            self.clips = [Clip(**x) for x in d]
+        finally:
+            self._restoring = False
+        keep = [c for c in self.clips if c.id in ids]
+        self._sels = keep
+        self._sel = next((c for c in keep if c.id == prim), keep[-1] if keep else None)
         self.load_props()
         self.after_edit()
 
     def push_undo(self):
-        self.undo.append(self.snapshot())
+        self.undo.append(self.undo_state())
         self.undo = self.undo[-80:]
         self.redo.clear()
         self.last_push = time.time()
+        self._coalesce = None
+
+    def push_undo_for(self, key):
+        """One undo step per burst of edits to the same control of the same clip: a property edit never merges
+        into an unrelated action that happened just before it."""
+        if getattr(self, "_restoring", False) or not getattr(self, "_undo_ready", False):
+            return
+        if key != getattr(self, "_coalesce", None) or time.time() - self.last_push > 0.8:
+            self.push_undo()
+            self._coalesce = key
+        else:
+            self.last_push = time.time()             # a slow slider drag stays one step
 
     def do_undo(self):
         if self.undo:
-            self.redo.append(self.snapshot())
+            self.redo.append(self.undo_state())
             self.restore(self.undo.pop())
+            self._coalesce = None
 
     def do_redo(self):
         if self.redo:
-            self.undo.append(self.snapshot())
+            self.undo.append(self.undo_state())
             self.restore(self.redo.pop())
+            self._coalesce = None
 
     # ------------------------------------------------------------------ time / zoom
     def total(self):
@@ -4664,7 +4930,8 @@ class MainWindow(QMainWindow):
 
     def project_dict(self):
         return dict(substyle=self.sub_style(), W=self.W, H=self.H,
-                    lib=[l for l in self.lib if not l.get("pending")], clips=[c.to_dict() for c in self.clips])
+                    lib=[{k: v for k, v in l.items() if k != "missing"} for l in self.lib if not l.get("pending")],
+                    clips=[c.to_dict() for c in self.clips])
 
     def document(self):
         return {**self._extra, **self.project_dict()}
@@ -4680,8 +4947,20 @@ class MainWindow(QMainWindow):
     def project_name(self):
         return store.project_name(self.proj_path) if self.proj_path else "Untitled"
 
+    def meta_doc(self):
+        return json.dumps([self.W, self.H, self.sub_style(),
+                           [l["path"] for l in self.lib if not l.get("pending")]])
+
     def is_dirty(self):
-        return bool(self.clips) and self.snapshot() != self._saved
+        """Unsaved changes: the clips, or the canvas size, subtitle look or library."""
+        if bool(self.clips) and self.snapshot() != self._saved:
+            return True
+        base = getattr(self, "_saved_meta", None)
+        return base is not None and self.meta_doc() != base
+
+    def mark_clean(self, snap=None):
+        self._saved = self.snapshot() if snap is None else snap
+        self._saved_meta = self.meta_doc()
 
     def update_title(self):
         if self.on_dashboard():
@@ -4751,7 +5030,8 @@ class MainWindow(QMainWindow):
             self.after_edit()
         finally:
             self._opening = False
-        self._extra, self._disk_sig, self._saved = {}, None, "[]"
+        self._extra, self._disk_sig = {}, None
+        self.mark_clean("[]")
         self._saved_doc = self._last_doc = None
         self._conflict = False
         self.set_save_state("")
@@ -4901,7 +5181,8 @@ class MainWindow(QMainWindow):
             return
         if res is None:
             return
-        self._saved_doc, self._saved = doc, snap
+        self._saved_doc = doc
+        self.mark_clean(snap)
         if self._rec_gen <= gen:                          # the file has caught up: drop the recovery copy
             if gen == self._gen:
                 self.rec_timer.stop()
@@ -4972,12 +5253,38 @@ class MainWindow(QMainWindow):
         }.get(st, "")
         b.setText(text)
         b.setToolTip(tip)
-        b.setIcon(mk_icon(icon, col) if icon else QIcon())
+        if icon:
+            b.setIcon(mk_icon(icon, col))
+        elif st == "saving":
+            self._spin_step()
+        else:                                    # same text position in every state: a blank 12 px icon
+            pm = QPixmap(24, 24)
+            pm.fill(Qt.transparent)
+            b.setIcon(QIcon(pm))
+        spin = getattr(self, "_spin_timer", None)
+        if st == "saving" and spin is None:
+            spin = self._spin_timer = QTimer(self)
+            spin.setInterval(100)
+            spin.timeout.connect(self._spin_step)
+        if spin is not None:
+            spin.start() if st == "saving" else spin.stop()
         b.setCursor(Qt.PointingHandCursor if st in ("failed", "conflict", "untitled") else Qt.ArrowCursor)
         if b.property("state") != st:
             b.setProperty("state", st)
             b.style().unpolish(b)
             b.style().polish(b)
+
+    def _spin_step(self):
+        """'Saving…' spinner: a small arc that turns."""
+        self._spin_a = (getattr(self, "_spin_a", 0) + 30) % 360
+        pm = QPixmap(24, 24)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor("#A6A8B0"), 2.4, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(QRectF(4, 4, 16, 16), -self._spin_a * 16, 270 * 16)
+        p.end()
+        self.lbl_save.setIcon(QIcon(pm))
 
     def save_state_clicked(self):
         st = self.save_state
@@ -5048,7 +5355,8 @@ class MainWindow(QMainWindow):
             self._extra = {k: v for k, v in d.items() if k not in PROJECT_KEYS}
             store.add_recent(path)
             self.track_project()
-        self._disk_sig, self._saved_doc, self._last_doc, self._saved = sig, doc, doc, snap
+        self._disk_sig, self._saved_doc, self._last_doc = sig, doc, doc
+        self.mark_clean(snap)
         self._done_gen = self._gen
         self._conflict = False
         self.rec_timer.stop()
@@ -5145,7 +5453,10 @@ class MainWindow(QMainWindow):
         if self.on_dashboard():
             return
         self.name_edit.setText(self.project_name())
-        self.name_edit.setFixedWidth(min(320, max(self.b_proj.width(), 160)))   # about where the name was
+        # about where the name was; it may shrink (to 80 px) rather than widen the window
+        self.name_edit.setMinimumWidth(80)
+        self.name_edit.setMaximumWidth(min(320, max(self.b_proj.width(), 160)))
+        self.name_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.b_proj.hide()
         self.name_edit.show()
         self.name_edit.setFocus(Qt.OtherFocusReason)
@@ -5161,7 +5472,27 @@ class MainWindow(QMainWindow):
             self.rename_project(name)
         self.tl.setFocus()
 
+    NAV_KEYS = (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End, Qt.Key_PageUp,
+                Qt.Key_PageDown)
+
+    def widget_wants_key(self, w, key, mods):
+        """True if the focused control w uses this key itself (so the editor shortcut must not take it)."""
+        from PySide6.QtWidgets import QAbstractSlider, QAbstractButton, QAbstractItemView
+        if mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return False
+        if key in self.NAV_KEYS:
+            return isinstance(w, (QAbstractSlider, QComboBox, QAbstractItemView))
+        if key == Qt.Key_Space:
+            return isinstance(w, (QAbstractButton, QComboBox))
+        if key in (Qt.Key_Delete, Qt.Key_Backspace):
+            return isinstance(w, QAbstractItemView)    # the Library handles Delete itself (removes the item)
+        return False
+
     def eventFilter(self, obj, ev):
+        if ev.type() == ev.Type.ShortcutOverride and isinstance(obj, getattr(self, "_key_widgets", ())) \
+                and obj.hasFocus() and self.widget_wants_key(obj, ev.key(), ev.modifiers()):
+            ev.accept()                                # deliver it to the control as a normal key press
+            return True
         if obj is getattr(self, "name_edit", None):
             if ev.type() == ev.Type.KeyPress and ev.key() == Qt.Key_Escape:
                 self.finish_rename(commit=False)
@@ -5489,8 +5820,12 @@ class MainWindow(QMainWindow):
             self.libview.clear()
             self.lib = []
             for l in d.get("lib", []):
-                if isinstance(l, dict) and os.path.exists(l.get("path", "")):
-                    self.add_to_library(l["path"], ask=False)
+                if not isinstance(l, dict) or not isinstance(l.get("path"), str) or not l["path"]:
+                    continue
+                if os.path.exists(l["path"]):
+                    self.add_to_library(l["path"], ask=False, known=l)
+                else:                                # offline: kept, so saving never drops it
+                    self.add_offline_lib(l)
             self.clips = clips
             for c in self.clips:
                 if c.nat:
@@ -5522,7 +5857,9 @@ class MainWindow(QMainWindow):
         self._saved_doc = None if (restore or rec) else doc
         self._gen += 1
         self._done_gen, self._rec_gen = self._gen, 0
-        self._saved = "[]" if restore else (saved_snap if rec else self.snapshot())
+        self.mark_clean("[]" if restore else (saved_snap if rec else None))
+        if restore or rec:
+            self._saved_meta = None if restore else self._saved_meta
         self._last_thumb = 0.0
         if rec is not None:
             self.undo = [saved_snap]                  # Ctrl+Z goes back to the last saved version
@@ -5546,12 +5883,27 @@ class MainWindow(QMainWindow):
                 threading.Thread(target=compute_wave, args=(c.path,), daemon=True).start()
         self.status("Recovered changes restored. Ctrl+Z goes back to the saved version." if rec else
                     f"Opened “{self.project_name()}”.")
-        missing = sorted({os.path.basename(c.path) for c in self.clips if not c.nat and c.kind != "sub"
-                          and c.path and not os.path.exists(c.path)})
-        if missing:
-            QMessageBox.warning(self, "Some media is missing", "These files could not be found, so their clips "
-                                "will be blank:\n\n" + "\n".join(missing[:12]))
+        self.warn_missing()
         return True
+
+    def warn_missing(self):
+        """Tell the user which media files are gone, and offer to find them."""
+        gone = self.missing_paths()
+        if not gone:
+            return
+        names = sorted({os.path.basename(p) for p in gone})
+        m = QMessageBox(self)
+        m.setIcon(QMessageBox.Warning)
+        m.setWindowTitle("Some media is missing")
+        m.setText("These files could not be found, so their clips will be blank:\n\n" + "\n".join(names[:12])
+                  + ("\n\u2026" if len(names) > 12 else ""))
+        m.setInformativeText("If you moved them, locate one and Parrot Studio looks for the others in the same folder.")
+        loc = m.addButton("Locate files\u2026", QMessageBox.AcceptRole)
+        m.addButton("Later", QMessageBox.RejectRole)
+        m.setDefaultButton(loc)
+        m.exec()
+        if m.clickedButton() is loc:
+            self.locate_file(gone[0])
 
     # ------------------------------------------------------------------ export
     def export(self):
@@ -5735,7 +6087,8 @@ QPushButton#primaryLarge:pressed { background: #2F67C4; border-color: #2F67C4; }
 QToolButton#cardMenu { border-radius: 4px; padding: 4px; }
 QToolButton#cardMenu:hover { background: #2A2B30; }
 QToolButton#cardMenu::menu-indicator { image: none; width: 0; }
-QLineEdit#cardNameEdit { font-size: 13px; font-weight: 600; border-color: #7FE5FF; background: #141518; }
+QLineEdit#cardNameEdit { font-size: 13px; font-weight: 600; border-color: #7FE5FF; background: #141518;
+              padding: 2px 6px; min-height: 0; max-height: 18px; }
 QFrame#recoveryBanner { background: #2A2418; border: 1px solid #5A4A2A; border-radius: 8px; }
 QLabel#bannerText { color: #E8E9EC; }
 QLabel#time { font-family: "Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono", monospace;
@@ -5883,8 +6236,8 @@ QListWidget#library::item { padding: 4px; margin: 2px; }
 
 /* ---------- group boxes: section header with hairline, no box ---------- */
 QGroupBox { border: none; border-top: 1px solid #26272C; margin-top: 20px; padding-top: 8px; background: transparent; }
-QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 0; padding: 0 0 4px 0; color: #E8E9EC;
-              font-weight: 600; }
+QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 0 4px 0; color: #E8E9EC;
+              font-weight: 600; left: -2px; }
 
 /* ---------- scroll areas & bars ---------- */
 QScrollArea { background: transparent; border: none; }
@@ -5901,7 +6254,7 @@ QScrollBar#timelineScroll:horizontal { height: 12px; background: #141518; border
 
 /* ---------- menus ---------- */
 QMenu { background: #222327; color: #E8E9EC; border: 1px solid #34353B; padding: 4px; }
-QMenu::item { padding: 6px 24px 6px 28px; border-radius: 4px; background: transparent; }
+QMenu::item { padding: 6px 32px 6px 28px; border-radius: 4px; background: transparent; }
 QMenu::item:selected { background: #3A78E0; color: #FFFFFF; }
 QMenu::item:disabled { color: #4F5158; background: transparent; }
 QMenu::separator { height: 1px; background: #34353B; margin: 4px 8px; }

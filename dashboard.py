@@ -157,7 +157,7 @@ def paint_empty_thumb(p, r, w, h, text="Empty project"):
     p.drawRoundedRect(box, 3, 3)
     p.setFont(_font(11))
     p.setPen(QColor(COL["dim"]))
-    p.drawText(QRectF(r.x(), box.bottom() + 6, r.width(), 16), Qt.AlignHCenter | Qt.AlignTop, text)
+    p.drawText(QRectF(r.x(), box.bottom() + 2, r.width(), 16), Qt.AlignHCenter | Qt.AlignTop, text)
 
 
 def paint_badge(p, text, x, y, right=False):
@@ -310,9 +310,6 @@ class ProjectCard(_Tile):
         parts = [store.relative_time(self.info.modified)]
         if self.length > 0:
             parts.append(fmt_dur(self.length))
-        a = aspect_label(self.W, self.H)
-        if a:
-            parts.append(a)
         if not self.info.managed:
             parts.append(nice_path(self.info.folder))
         return "  ·  ".join(x for x in parts if x)
@@ -384,8 +381,8 @@ class ProjectCard(_Tile):
         tr = self.thumb_rect()
         e = QLineEdit(self.info.name, self)
         e.setObjectName("cardNameEdit")
-        e.setGeometry(int(self.card_rect().x() + 8), int(tr.bottom() + 8), int(self.card_rect().width() - 16), 24)
-        e.selectAll()
+        e.setGeometry(int(self.card_rect().x() + 5), int(tr.bottom() + 8), int(self.card_rect().width() - 10), 24)
+        e.setSelection(len(self.info.name), -len(self.info.name))   # all selected, the start of the name in view
         e.show()
         e.setFocus(Qt.OtherFocusReason)
         self.editor = e
@@ -610,9 +607,14 @@ class Dashboard(QWidget):
         content.setObjectName("dashContent")
         content.setMaximumWidth(CONTENT_MAX)
         cl = QVBoxLayout(content)
-        cl.setContentsMargins(32, 32, 32, 32)
+        cl.setContentsMargins(32 - RING, 32, 32 - RING, 32)   # the cards keep RING px for their focus ring ...
         cl.setSpacing(0)
         self.content_layout = cl
+        head = QWidget()                                       # ... so everything else is inset by RING to line up
+        hv = QVBoxLayout(head)
+        hv.setContentsMargins(RING, 0, RING, 0)
+        hv.setSpacing(0)
+        cl.addWidget(head)
         tr = QHBoxLayout()
         title = QLabel("Your projects")
         title.setObjectName("pageTitle")
@@ -621,8 +623,8 @@ class Dashboard(QWidget):
         self.lbl_count = QLabel("")
         self.lbl_count.setObjectName("hint")
         tr.addWidget(self.lbl_count, 0, Qt.AlignBottom)
-        cl.addLayout(tr)
-        cl.addSpacing(8)
+        hv.addLayout(tr)
+        hv.addSpacing(8)
         loc = QHBoxLayout()
         loc.setSpacing(0)
         fi = QLabel()
@@ -640,8 +642,8 @@ class Dashboard(QWidget):
                                        lambda: reveal_in_file_manager(self.projects_dir()))
         loc.addWidget(self.b_show_dir)
         loc.addStretch(1)
-        cl.addLayout(loc)
-        cl.addSpacing(24)
+        hv.addLayout(loc)
+        hv.addSpacing(24)
 
         # recovery banner
         self.banner = QFrame()
@@ -655,6 +657,9 @@ class Dashboard(QWidget):
         rb.addWidget(wi)
         self.banner_text = QLabel()
         self.banner_text.setObjectName("bannerText")
+        self.banner_text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)   # elided, never widens the window
+        self.banner_full = ""
+        self.banner_text.installEventFilter(self)
         rb.addWidget(self.banner_text, 1)
         self.banner_discard = self._button("Discard", "ghost", "Throw the recovered changes away", self.discard_banner)
         rb.addWidget(self.banner_discard)
@@ -666,7 +671,7 @@ class Dashboard(QWidget):
         bw.setContentsMargins(0, 0, 0, 20)
         bw.addWidget(self.banner)
         self.banner_wrap.hide()
-        cl.addWidget(self.banner_wrap)
+        hv.addWidget(self.banner_wrap)
 
         self.grid = ProjectGrid()
         self.grid.new_card.clicked.connect(self.new_project)
@@ -676,7 +681,7 @@ class Dashboard(QWidget):
         self.empty = QWidget()
         self.empty.setObjectName("emptyState")
         el = QVBoxLayout(self.empty)
-        el.setContentsMargins(0, 24, 0, 0)
+        el.setContentsMargins(RING, 24, RING, 0)
         el.setSpacing(8)
         el.addStretch(1)
         art = QLabel()
@@ -814,9 +819,10 @@ class Dashboard(QWidget):
                 import time
                 when = " from " + time.strftime("%H:%M" if time.time() - info.saved_at < 86400 else "%d %b %H:%M",
                                                 time.localtime(info.saved_at)).lstrip("0")
-            self.banner_text.setText(f"“{rec.name}” wasn't closed properly. Recovered changes{when} are "
-                                     "available.")
-            self.banner_text.setToolTip(rec.path)
+            self.banner_full = f"“{rec.name}” wasn't closed properly. Recovered changes{when} are available."
+            self.banner_text.setText(self.banner_full)
+            self.banner_text.setToolTip(f"{self.banner_full}\n{rec.path}")
+            self._elide_banner()
         self.banner_wrap.setVisible(rec is not None)
 
     def cards(self):
@@ -838,8 +844,20 @@ class Dashboard(QWidget):
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         m = 24 if self.width() < 1100 else 32
-        self.content_layout.setContentsMargins(m, 32, m, 32)
+        self.content_layout.setContentsMargins(m - RING, 32, m - RING, 32)
+        self.content.setMaximumWidth(1640 if self.width() >= 2200 else CONTENT_MAX)
         self._elide_dir()
+        self._elide_banner()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.banner_text and ev.type() == ev.Type.Resize:
+            self._elide_banner()
+        return super().eventFilter(obj, ev)
+
+    def _elide_banner(self):
+        w = self.banner_text.width()
+        if w > 20:
+            self.banner_text.setText(self.banner_text.fontMetrics().elidedText(self.banner_full, Qt.ElideRight, w))
 
     def _elide_dir(self):
         d = self.projects_dir()

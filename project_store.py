@@ -368,9 +368,44 @@ def validate(d):
     if not isinstance(d.get("lib", []), list):
         raise ProjectError("The project's media library list is damaged.")
     for k in ("W", "H"):
-        if not isinstance(d.get(k), (int, float)) or d[k] <= 0:
+        if not isinstance(d.get(k), (int, float)) or isinstance(d[k], bool) or d[k] <= 0:
             raise ProjectError("The project's video size is missing or damaged.")
+    for i, c in enumerate(d["clips"], 1):
+        problem = _clip_problem(c)
+        if problem:
+            raise ProjectError(f"Clip {i} of the project is damaged ({problem}).")
     return d
+
+
+_CLIP_NUMBERS = ("start", "inp", "dur", "srcdur", "w", "h", "fin", "fout", "vol", "scale", "x", "y", "tdur", "csize",
+                 "wdur", "cbold", "nat")
+_CLIP_TEXTS = ("id", "name", "path", "kind", "ttype", "text", "cfont", "ccol", "cbox")
+
+
+def _clip_problem(c):
+    """Why a stored clip can't be used, or "" if it is fine. Only the keys present are checked (older files have
+    fewer); unknown keys are allowed."""
+    import math
+    for k in _CLIP_NUMBERS:
+        if k in c:
+            v = c[k]
+            if isinstance(v, bool) and k != "nat" or not isinstance(v, (int, float)) or not math.isfinite(v):
+                return f"\u201c{k}\u201d should be a number"
+    for k in ("start", "inp", "fin", "fout"):
+        if k in c and c[k] < 0:
+            return f"\u201c{k}\u201d is negative"
+    if "dur" in c and c["dur"] <= 0:
+        return "its length is zero"
+    if "track" in c and (not isinstance(c["track"], int) or isinstance(c["track"], bool) or not 0 <= c["track"] <= 5):
+        return "it is on a track that doesn't exist"
+    for k in _CLIP_TEXTS:
+        if k in c and not isinstance(c[k], str):
+            return f"\u201c{k}\u201d should be text"
+    if c.get("kind", "video") not in ("video", "image", "audio", "sub"):
+        return "unknown clip type"
+    if "words" in c and not isinstance(c["words"], list):
+        return "its subtitle words are damaged"
+    return ""
 
 
 def _read_document(path):
