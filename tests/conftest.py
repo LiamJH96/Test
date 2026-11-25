@@ -24,6 +24,10 @@ _FAKE_HOME = tempfile.mkdtemp(prefix="cs_test_home_")
 os.environ["HOME"] = _FAKE_HOME
 os.environ["USERPROFILE"] = _FAKE_HOME
 os.environ.setdefault("XDG_RUNTIME_DIR", tempfile.mkdtemp(prefix="cs_xdg_"))
+os.environ["APPDATA"] = os.path.join(_FAKE_HOME, "AppData", "Roaming")
+# Parrot Studio (round 2) keeps settings / projects here; tests must never touch the real ones.
+os.environ["PARROT_STUDIO_CONFIG_DIR"] = os.path.join(_FAKE_HOME, "parrot_config")
+os.environ["PARROT_STUDIO_PROJECTS_DIR"] = os.path.join(_FAKE_HOME, "parrot_projects")
 os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia*=false")
 
 import pytest  # noqa: E402
@@ -107,6 +111,29 @@ def media(tmp_path_factory):
         "-c:v", "libx264", "-preset", "ultrafast", "-color_primaries", "bt2020", "-color_trc", "smpte2084",
         "-colorspace", "bt2020nc", hdr)
     return dict(video=vid, video_noaudio=vid2, wav=wav, png=png, hdr=hdr, dir=str(d))
+
+
+@pytest.fixture(scope="session")
+def rich_media(tmp_path_factory):
+    """Realistic samples for the workflow tests: vertical 1080x1920 60 fps gameplay-like clip with stereo audio,
+    a horizontal 1920x1080 clip, an mp3 music bed, a PNG overlay and a solid-blue vertical clip (for pixel checks)."""
+    d = tmp_path_factory.mktemp("rich_media")
+    out = dict(dir=str(d), vert=str(d / "gameplay_vertical.mp4"), horiz=str(d / "horizontal.mp4"),
+               mp3=str(d / "music.mp3"), png=str(d / "overlay.png"), blue=str(d / "blue_vertical.mp4"))
+    _ff("-f", "lavfi", "-i", "testsrc2=size=1080x1920:rate=60:duration=4", "-f", "lavfi", "-i",
+        "sine=frequency=330:duration=4", "-f", "lavfi", "-i", "sine=frequency=550:duration=4",
+        "-filter_complex", "[1][2]amerge=inputs=2[a]", "-map", "0:v", "-map", "[a]", "-c:v", "libx264",
+        "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ac", "2", out["vert"])
+    _ff("-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=3", "-f", "lavfi", "-i",
+        "sine=frequency=440:duration=3", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ac", "2", out["horiz"])
+    _ff("-f", "lavfi", "-i", "sine=frequency=220:duration=8", "-ac", "2", "-c:a", "libmp3lame", "-b:a", "128k",
+        out["mp3"])
+    _ff("-f", "lavfi", "-i", "color=c=0x00ff00:size=400x200,format=rgba", "-frames:v", "1", out["png"])
+    _ff("-f", "lavfi", "-i", "color=c=0x0000ff:size=540x960:rate=30:duration=4", "-f", "lavfi", "-i",
+        "sine=frequency=500:duration=4", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ac", "2", "-shortest", out["blue"])
+    return out
 
 
 # ---------------------------------------------------------------- modal dialogs never block
@@ -253,8 +280,13 @@ def dispose_window(w):
     try:
         w.playing = False
         w.timer.stop()
-        w.auto_timer.stop()
+        stop_autosave(w)
         w._saved = w.snapshot()       # not dirty -> closeEvent does not ask to save
+        if hasattr(w, "is_dirty"):
+            try:
+                w.is_dirty = lambda: False
+            except Exception:
+                pass
         w.close()
     except RuntimeError:
         return
@@ -269,16 +301,32 @@ def dispose_window(w):
     _flush(app)
 
 
+def stop_autosave(w):
+    """Stop every autosave-ish timer (works for the round-1 auto_timer and round-2 debounced timers)."""
+    from PySide6.QtCore import QTimer
+    for name in ("auto_timer", "save_timer", "save_max_timer", "rec_timer", "autosave_timer", "_autosave_timer"):
+        t = getattr(w, name, None)
+        if isinstance(t, QTimer):
+            t.stop()
+
+
+def show_editor(w):
+    """Round 2: the main window starts on the project dashboard. Switch to the editor when that exists."""
+    if hasattr(w, "show_editor"):
+        w.show_editor()
+
+
 @pytest.fixture
 def win(cs, qapp, modals):
-    """A fresh, shown MainWindow. Never leaves modal dialogs or autosave files behind."""
+    """A fresh, shown MainWindow on the editor page. Never leaves modal dialogs or autosave files behind."""
     w = cs.MainWindow()
-    w.auto_timer.stop()
+    stop_autosave(w)
+    show_editor(w)
     w.show()
     _flush(qapp)
     yield w
     dispose_window(w)
     try:
-        os.remove(cs.MainWindow.AUTOSAVE)
+        os.remove(getattr(cs.MainWindow, "AUTOSAVE", os.path.join(_FAKE_HOME, ".clip_studio", "autosave.clipproj")))
     except OSError:
         pass

@@ -1,7 +1,8 @@
-"""Clip Studio - a free Clipchamp-style multi-track editor (PySide6 + ffmpeg).
+"""Parrot Studio - a free Clipchamp-style multi-track editor (PySide6 + ffmpeg).
 
 Run:  python clip_studio.py
 Needs: pip install PySide6 numpy imageio-ffmpeg   (ffmpeg on PATH or imageio-ffmpeg)
+Projects, autosave and crash recovery live in project_store.py; the project home screen in dashboard.py.
 """
 import sys, os, re, json, base64, hashlib, copy, math, shutil, subprocess, threading, time, tempfile, uuid
 
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import (QColorDialog, QPlainTextEdit, QFontComboBox, QFra
                                QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsItem, QGraphicsPixmapItem, QGraphicsPathItem, QGraphicsSimpleTextItem, QSlider, QTabWidget, QProgressBar,
                                QSplitter, QScrollArea, QFileDialog, QMessageBox, QScrollBar, QMenu, QGroupBox,
                                QFormLayout, QCheckBox, QProgressDialog, QAbstractSpinBox, QLineEdit, QInputDialog,
-                               QGridLayout, QStyledItemDelegate, QProxyStyle, QStyle)
+                               QGridLayout, QStyledItemDelegate, QProxyStyle, QStyle, QStackedWidget)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 
@@ -21,6 +22,10 @@ try:
     import numpy as np
 except Exception:  # waveform is optional
     np = None
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # sibling modules, wherever we are started from
+import project_store as store  # noqa: E402
+from dashboard import Dashboard, reveal_in_file_manager  # noqa: E402
 
 # ----------------------------------------------------------------------------- ffmpeg helpers
 
@@ -215,6 +220,11 @@ def mk_icon(name, color="#e6e6eb", size=22):
     elif name == "fit":
         for (x, y, dx, dy) in [(4, 4, 1, 1), (18, 4, -1, 1), (4, 18, 1, -1), (18, 18, -1, -1)]:
             p.drawPolyline(QPolygonF([P(x + 5 * dx, y), P(x, y), P(x, y + 5 * dy)]))
+    elif name == "grid":
+        for x, y in ((4, 4), (12.5, 4), (4, 12.5), (12.5, 12.5)):
+            p.drawRoundedRect(QRectF(x, y, 5.5, 5.5), 1.2, 1.2)
+    elif name == "chev_down":
+        p.drawPolyline(QPolygonF([P(6, 8.5), P(11, 13.5), P(16, 8.5)]))
     p.end()
     return QIcon(pm)
 
@@ -2541,6 +2551,16 @@ def scrolled(w):
     return sa
 
 
+APP_TITLE = "Parrot Studio"
+PROJECT_FILTER = "Parrot Studio project (*.clipproj)"
+PROJECT_KEYS = ("substyle", "W", "H", "lib", "clips")      # what project_dict() writes; other keys are kept as-is
+
+
+class Relay(QObject):
+    """Runs a function on the GUI thread (worker threads emit; the queued connection delivers)."""
+    call = Signal(object)
+
+
 CANVAS = {"Vertical 1080x1920": (1080, 1920), "Landscape 1920x1080": (1920, 1080), "Square 1080x1080": (1080, 1080)}
 
 
@@ -2591,7 +2611,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Clip Studio")
+        self.setWindowTitle(APP_TITLE)
         self.resize(1500, 920)
         self.clips, self.lib = [], []
         self.sel = None
@@ -2603,6 +2623,7 @@ class MainWindow(QMainWindow):
         self._saved = "[]"
         self._loading = False
         self.work = tempfile.mkdtemp(prefix="clipstudio_")
+        self.init_project_state()
 
         # library
         self.libview = LibraryList()
@@ -2755,18 +2776,30 @@ class MainWindow(QMainWindow):
         rv.setSpacing(0)
         rv.addWidget(self.header)
         rv.addWidget(main, 1)
-        self.setCentralWidget(root)
+        self.editor_page = root
+        # the project home screen and the editor share the window; show_dashboard() / show_editor() switch
+        self.dashboard = Dashboard()
+        self.dashboard.openRequested.connect(self.open_project)
+        self.dashboard.newRequested.connect(self.create_and_open)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.editor_page)
+        self.pages.addWidget(self.dashboard)
+        self.setCentralWidget(self.pages)
         self.sb_hint = QLabel()
         self.sb_hint.setTextFormat(Qt.RichText)
         self.sb_hint.setText(hint_html(HINTS))
         self.statusBar().addPermanentWidget(self.sb_hint)
         self.status("Welcome! Import media to get started.")
 
-        # shortcuts
-        def sc(keys, fn, guard=True):
+        # shortcuts (editor ones are switched off while the project dashboard is showing)
+        self.editor_shortcuts = []
+
+        def sc(keys, fn, guard=True, editor=True):
             s = QShortcut(QKeySequence(keys), self)
             s.setContext(Qt.ApplicationShortcut)
             s.activated.connect(lambda: (None if guard and self.typing() else fn()))
+            if editor:
+                self.editor_shortcuts.append(s)
         sc("Space", self.toggle_play)
         sc("S", self.split)
         sc("Delete", self.delete_sel)
@@ -2787,15 +2820,19 @@ class MainWindow(QMainWindow):
         sc("Backspace", self.delete_sel)
         sc("Ctrl+A", self.select_all)
         sc("Z", self.zoom_clip)
-        sc("Ctrl+O", self.open_project, False)
+        sc("Ctrl+O", self.open_project, False, editor=False)
         sc("Ctrl+E", self.export, False)
+        sc("Ctrl+Shift+S", self.save_project_as, False)
+        sc("Ctrl+N", self.new_project, False, editor=False)
 
         self.timer = QTimer(self)
         self.timer.setInterval(16)
         self.timer.timeout.connect(self.tick)
+        # autosave: edits are noticed right away (after_edit) or by this poll (library, canvas, subtitle look...);
+        # stopping auto_timer switches autosave off (the tests do this)
         self.auto_timer = QTimer(self)
-        self.auto_timer.setInterval(45000)
-        self.auto_timer.timeout.connect(self.autosave)
+        self.auto_timer.setInterval(1000)
+        self.auto_timer.timeout.connect(self.note_change)
         self.auto_timer.start()
         self.wall0 = 0.0
         self.t_at_play = 0.0
@@ -2917,10 +2954,29 @@ class MainWindow(QMainWindow):
         hd = QHBoxLayout()
         hd.setContentsMargins(12, 6, 12, 6)
         hd.setSpacing(8)
-        t = QLabel("Clip Studio")
+        self.b_home = btn("", "Back to your projects", self.show_dashboard, "round", "grid", (28, 28))
+        hd.addWidget(self.b_home)
+        t = QLabel(APP_TITLE)
         t.setObjectName("title")
         hd.addWidget(t)
-        hd.addSpacing(16)
+        crumb = QLabel("/")
+        crumb.setObjectName("crumb")
+        hd.addWidget(crumb)
+        self.b_proj = QPushButton("Untitled")
+        self.b_proj.setObjectName("projectName")
+        self.b_proj.setToolTip("Project options: rename, show in folder, save a copy, back to your projects")
+        self.b_proj.setCursor(Qt.PointingHandCursor)
+        self.b_proj.setIcon(mk_icon("chev_down", "#A6A8B0"))
+        self.b_proj.setIconSize(QSize(12, 12))
+        self.b_proj.setLayoutDirection(Qt.RightToLeft)       # chevron after the name
+        self.b_proj.clicked.connect(self.project_menu)
+        hd.addWidget(self.b_proj)
+        self.lbl_save = QPushButton("")
+        self.lbl_save.setObjectName("saveState")
+        self.lbl_save.setCursor(Qt.PointingHandCursor)
+        self.lbl_save.clicked.connect(self.save_state_clicked)
+        hd.addWidget(self.lbl_save)
+        hd.addSpacing(8)
         hd.addWidget(btn("Open project", "Open a saved project", self.open_project, "ghost"))
         hd.addWidget(btn("Save project", "Save the project  (Ctrl+S)", self.save_project, "ghost"))
         hd.addStretch(1)
@@ -3402,7 +3458,7 @@ class MainWindow(QMainWindow):
         f.setHorizontalSpacing(12)
         f.setVerticalSpacing(8)
 
-    SUB_DEF_FILE = os.path.join(os.path.expanduser("~"), ".clip_studio", "sub_defaults.json")
+    SUB_DEF_FILE = os.path.join(store.config_dir(), "sub_defaults.json")
 
     def sub_factory(self):
         fams = set(QFontDatabase.families())
@@ -3411,6 +3467,7 @@ class MainWindow(QMainWindow):
                     anim="Zoom In", tag_anim="Same as subtitle", anim_ms=200, upper=False)
 
     def load_sub_defaults(self):
+        store.migrate_legacy_config()          # first run after Clip Studio: bring the saved look along
         try:
             with open(self.SUB_DEF_FILE, encoding="utf-8") as f:
                 d = {**self.sub_factory(), **json.load(f)}
@@ -3548,7 +3605,7 @@ class MainWindow(QMainWindow):
             import faster_whisper  # noqa: F401
         except Exception:
             QMessageBox.information(self, "Subtitles", "Auto subtitles need the speech package. Open PowerShell and "
-                                    "run:\n\npip install faster-whisper\n\nthen restart Clip Studio.")
+                                    "run:\n\npip install faster-whisper\n\nthen restart Parrot Studio.")
             return
         if any(x.kind == "sub" and any(x.start < c.end and x.end > c.start for c in src) for x in self.clips):
             if QMessageBox.question(self, "Subtitles", "Replace the subtitles already on the timeline for "
@@ -3849,7 +3906,7 @@ class MainWindow(QMainWindow):
         if not has_zscale():
             QMessageBox.warning(self, "Can't convert", "This copy of ffmpeg can't convert HDR (it has no 'zscale' "
                                 "filter). Install the full ffmpeg build: open PowerShell and run\n\n"
-                                "winget install Gyan.FFmpeg\n\nthen restart Clip Studio.")
+                                "winget install Gyan.FFmpeg\n\nthen restart Parrot Studio.")
             self.start_bg(info)
             return
         if info.get("pending"):
@@ -4081,6 +4138,7 @@ class MainWindow(QMainWindow):
     def after_edit(self, light=False):
         if not light:
             self.update_title()
+            self.note_change()
         self.sync_scroll()
         self.tl.update()
         self.update_preview(force=True)
@@ -4298,145 +4356,840 @@ class MainWindow(QMainWindow):
                 s.show_clip(c, self.W, self.H, self.t, self.playing, a, vol, off, wipe)
 
     # ------------------------------------------------------------------ project files
-    AUTOSAVE = os.path.join(os.path.expanduser("~"), ".clip_studio", "autosave.clipproj")
+    # A project is a .clipproj file (see project_store.py). Changes are saved automatically: an edit is noticed at
+    # once (after_edit) or by the once-a-second poll (auto_timer), the project is written SAVE_DEBOUNCE_MS after
+    # the last change (at least every SAVE_MAX_MS while changes keep coming), serialised here on the GUI thread and
+    # written atomically by a worker thread. A crash-recovery snapshot is written RECOVERY_MS after each change and
+    # removed once the project file has caught up.
+    AUTOSAVE = store.legacy_autosave_path()        # Clip Studio's autosave file: offered for restore once
+    SAVE_DEBOUNCE_MS, SAVE_MAX_MS, RECOVERY_MS = 2000, 30000, 400
+
+    def init_project_state(self):
+        self.writer = store.AsyncWriter()
+        self.relay = Relay()
+        self.relay.call.connect(lambda f: f())
+        self.track_session = False   # main() turns this on: the session lock records the open project
+        self.unclean_sessions = []
+        self._extra = {}             # keys of the opened file that project_dict() doesn't make (kept when saving)
+        self._disk_sig = None        # (mtime, size) of the project file when we last loaded or saved it
+        self._last_doc = None        # the project state (JSON) last noticed ...
+        self._saved_doc = None       # ... and last written to the project file
+        self._gen = self._rec_gen = self._done_gen = 0
+        self._conflict = False
+        self._opening = False
+        self._last_thumb = 0.0
+        self.save_state, self.save_error = "", ""
+
+        def single(ms, fn):
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(ms)
+            t.timeout.connect(fn)
+            return t
+        self.save_timer = single(self.SAVE_DEBOUNCE_MS, self.autosave)
+        self.save_max_timer = single(self.SAVE_MAX_MS, self.autosave)
+        self.rec_timer = single(self.RECOVERY_MS, self.write_recovery)
+
+    def _post(self, fn):
+        """Run fn on the GUI thread (safe to call from the writer thread)."""
+        try:
+            self.relay.call.emit(fn)
+        except RuntimeError:          # window already gone
+            pass
 
     def project_dict(self):
         return dict(substyle=self.sub_style(), W=self.W, H=self.H,
                     lib=[l for l in self.lib if not l.get("pending")], clips=[c.to_dict() for c in self.clips])
 
+    def document(self):
+        return {**self._extra, **self.project_dict()}
+
+    def document_text(self, path=None):
+        path = path or self.proj_path
+        return json.dumps(store.prepare_document(self.document(), store.project_name(path) if path else None),
+                          ensure_ascii=False)
+
+    def state_doc(self):
+        return json.dumps(self.project_dict(), ensure_ascii=False)
+
+    def project_name(self):
+        return store.project_name(self.proj_path) if self.proj_path else "Untitled"
+
     def is_dirty(self):
         return bool(self.clips) and self.snapshot() != self._saved
 
     def update_title(self):
+        if self.on_dashboard():
+            self.setWindowTitle(APP_TITLE)
+            return
         nm = os.path.basename(self.proj_path) if self.proj_path else "Untitled"
-        self.setWindowTitle(f"Clip Studio - {nm}{' *' if self.is_dirty() else ''}")
+        self.setWindowTitle(f"{APP_TITLE} - {nm}{' *' if self.is_dirty() else ''}")
+        if getattr(self, "b_proj", None) is not None:
+            self.b_proj.setText(self.project_name())
+            if not self.proj_path:
+                self.set_save_state("untitled" if self.is_dirty() else "")
+
+    # ---- pages
+    def on_dashboard(self):
+        return getattr(self, "pages", None) is not None and self.pages.currentWidget() is self.dashboard
+
+    def show_editor(self):
+        self.pages.setCurrentWidget(self.editor_page)
+        for s in self.editor_shortcuts:
+            s.setEnabled(True)
+        self.sb_hint.show()
+        self.update_title()
+        self.tl.setFocus()
+        QTimer.singleShot(0, self.view.fit)
+
+    def show_dashboard(self):
+        """Back to the project home screen. The open project is saved first (False if the user cancelled)."""
+        if not self.on_dashboard() and (self.proj_path or self.is_dirty()):
+            if not self.leave_project("dashboard"):
+                return False
+        if self.proj_path or self.clips or self.lib:
+            self.close_project()
+        self.pages.setCurrentWidget(self.dashboard)
+        for s in self.editor_shortcuts:            # Delete, arrows, Space... belong to the dashboard now
+            s.setEnabled(False)
+        self.sb_hint.hide()
+        self.statusBar().clearMessage()
+        self.dashboard.refresh()
+        self.update_title()
+        self.dashboard.focus_first()
+        return True
+
+    def close_project(self):
+        """Empty the editor. The project must already be saved (see leave_project)."""
+        if self.playing:
+            self.toggle_play()
+        for t in (self.save_timer, self.save_max_timer, self.rec_timer):
+            t.stop()
+        self._opening = True
+        try:
+            self.proj_path = None
+            self.clips, self.lib = [], []
+            self.libview.clear()
+            self.sel = None
+            self.undo.clear()
+            self.redo.clear()
+            self.t = 0.0
+            self.apply_sub_style(self.sub_factory())
+            self.load_sub_defaults()
+            self.cb_canvas.setCurrentIndex(0)
+            self.load_props()
+            self.after_edit()
+        finally:
+            self._opening = False
+        self._extra, self._disk_sig, self._saved = {}, None, "[]"
+        self._saved_doc = self._last_doc = None
+        self._conflict = False
+        self.set_save_state("")
+        self.track_project()
+
+    def track_project(self):
+        if self.track_session:
+            store.update_session_lock(self.proj_path)
+
+    def leave_project(self, why="open"):
+        """Make the current project's changes safe before switching away or closing. False = stay here."""
+        self.save_timer.stop()
+        self.save_max_timer.stop()
+        if self.proj_path:
+            if self._conflict:
+                self.resolve_conflict()
+            if self.autosave(wait=True):
+                self.save_thumbnail()
+                return True
+            r = QMessageBox.question(
+                self, "Changes not saved", "Your latest changes could not be saved to the project file:\n\n"
+                f"{self.save_error or 'The file was changed by another program.'}\n\nThey are kept as recovered "
+                "changes, and Parrot Studio will offer them the next time you open this project. Continue anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                return False
+            self.keep_unsaved_as_recovery()
+            return True
+        if not self.is_dirty():
+            return True
+        if why == "open":
+            return QMessageBox.question(
+                self, "Open project", "Your current project has unsaved changes. Open another project anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+        return self.ask_save_untitled("Save your project before closing?" if why == "close" else
+                                      "Save this project before leaving it?")
+
+    def ask_save_untitled(self, text):
+        m = QMessageBox(self)
+        m.setIcon(QMessageBox.Question)
+        m.setWindowTitle("Unsaved changes")
+        m.setText(text)
+        sv = m.addButton("Save", QMessageBox.AcceptRole)
+        ds = m.addButton("Don't save", QMessageBox.DestructiveRole)
+        ds.setObjectName("danger")
+        ds.style().unpolish(ds)
+        ds.style().polish(ds)
+        cn = m.addButton("Cancel", QMessageBox.RejectRole)
+        m.setDefaultButton(sv)
+        m.exec()
+        if m.clickedButton() is cn:
+            return False
+        if m.clickedButton() is sv and not self.save_project():
+            return False
+        return True
+
+    def keep_unsaved_as_recovery(self):
+        """Store the current state as a 'kept' recovery snapshot (offered next time the project is opened)."""
+        self.writer.wait_idle(10)
+        try:
+            p = store.write_recovery(self.proj_path, self.document_text())
+            store.keep_recovery(store.RecoveryInfo(p, self.proj_path, time.time()))
+        except Exception as e:
+            store.report_problem(f"Could not keep the unsaved changes of {self.proj_path}", e)
+            QMessageBox.warning(self, "Could not keep changes", f"The unsaved changes could not be stored:\n{e}")
+
+    # ---- autosave
+    def note_change(self):
+        """After edits and once a second: start the autosave countdown if the project changed."""
+        timer = getattr(self, "auto_timer", None)
+        if self._opening or timer is None or not timer.isActive() or self.on_dashboard():
+            return
+        if not self.proj_path and not self.clips:
+            return
+        doc = self.state_doc()
+        if doc == self._last_doc:
+            return
+        self._last_doc = doc
+        self._gen += 1
+        self.rec_timer.start()
+        if self.proj_path and not self._conflict:
+            self.save_timer.start()                       # restarts: 2 s after the last change ...
+            if not self.save_max_timer.isActive():        # ... but never more than 30 s behind
+                self.save_max_timer.start()
+            self.set_save_state("pending")
+
+    def autosave(self, wait=False):
+        """Save changes to the project file now, in the background (wait=True: before returning). Untitled work
+        goes to a recovery snapshot instead. Returns False if saving failed or is blocked by a conflict."""
+        self.save_timer.stop()
+        self.save_max_timer.stop()
+        if self._opening:
+            return True
+        if not self.proj_path:
+            if self.is_dirty():
+                self.write_recovery()
+            if wait:
+                self.writer.wait_idle(10)
+            self.update_title()
+            return True
+        if self._conflict:
+            self.set_save_state("conflict")
+            return False
+        doc = self.state_doc()
+        self._last_doc = doc
+        if doc == self._saved_doc and self.save_state != "failed":
+            self.set_save_state("saved")
+            return True
+        text, path, gen, snap = self.document_text(), self.proj_path, self._gen, self.snapshot()
+        self.set_save_state("saving")
+
+        def job():
+            if self.proj_path != path:                    # project switched meanwhile: nothing to do
+                return None
+            sig = store.save_project_text(path, text, self._disk_sig)
+            self._disk_sig = sig
+            return sig
+        if wait:
+            self.writer.wait_idle(15)
+            try:
+                res, err = job(), None
+            except Exception as e:
+                res, err = None, e
+            self.save_done(path, doc, snap, gen, res, err)
+            return self.save_state == "saved"
+        self.writer.submit(("save", path), job,
+                           lambda res, err: self._post(lambda: self.save_done(path, doc, snap, gen, res, err)))
+        return True
+
+    def save_done(self, path, doc, snap, gen, res, err):
+        if path != self.proj_path or gen < self._done_gen:
+            return
+        self._done_gen = gen
+        if isinstance(err, store.ConflictError):
+            self._conflict = True
+            self.save_error = str(err)
+            self.set_save_state("conflict")
+            self.write_recovery(force=True)
+            QTimer.singleShot(0, self.resolve_conflict)
+            return
+        if err is not None:
+            self.save_error = str(err)
+            self.set_save_state("failed")
+            self.status("Autosave failed: " + str(err).replace("\n", " "), 12000)
+            self.write_recovery(force=True)
+            self.save_max_timer.start()                   # try again in a while
+            return
+        if res is None:
+            return
+        self._saved_doc, self._saved = doc, snap
+        if self._rec_gen <= gen:                          # the file has caught up: drop the recovery copy
+            if gen == self._gen:
+                self.rec_timer.stop()
+            self.writer.submit(("rec", path), lambda: store.discard_recovery(path))
+        self.set_save_state("saved" if doc == self._last_doc else "pending")
+        self.update_title()
+        if time.time() - self._last_thumb > 60:
+            self.save_thumbnail()
+
+    def write_recovery(self, force=False):
+        """Write a crash-recovery snapshot of unsaved work (in the background)."""
+        if self._opening or self.on_dashboard() or (not self.proj_path and not self.clips):
+            return
+        if not force and (self.state_doc() == self._saved_doc if self.proj_path else not self.is_dirty()):
+            return
+        text, path = self.document_text(), self.proj_path
+        self._rec_gen = self._gen
+
+        def done(res, err):
+            if err is not None:
+                store.report_problem(f"Could not write the recovery copy of {path or 'an untitled project'}", err)
+                self._post(lambda: self.status(f"Couldn't write a recovery copy: {err}", 12000))
+        self.writer.submit(("rec", path), lambda: store.write_recovery(path, text), done)
+
+    def set_save_state(self, st):
+        self.save_state = st
+        b = getattr(self, "lbl_save", None)
+        if b is None:
+            return
+        first = (self.save_error or "").split("\n")[-1]
+        text, tip = {
+            "": ("", ""),
+            "untitled": ("Not saved yet", "This project isn't stored in a file yet. Click to choose where to keep it."),
+            "pending": ("Saving…", "Your changes are stored automatically in a moment."),
+            "saving": ("Saving…", "Storing your changes…"),
+            "saved": ("Saved", f"Every change is stored automatically in\n{self.proj_path}"),
+            "failed": ("Not saved", f"Autosave failed: {first}\nYour changes are kept in a recovery copy. "
+                                    "Click to try again."),
+            "conflict": ("Changed on disk", "The project file was changed by another program, so autosave is "
+                                            "paused. Click to choose what to do."),
+        }[st]
+        b.setText(text)
+        b.setToolTip(tip)
+        if b.property("state") != st:
+            b.setProperty("state", st)
+            b.style().unpolish(b)
+            b.style().polish(b)
+        b.setVisible(bool(text))
+
+    def save_state_clicked(self):
+        st = self.save_state
+        if st == "conflict":
+            self.resolve_conflict()
+        elif st == "failed":
+            self.autosave()
+        elif st == "untitled":
+            self.save_project()
+        else:
+            self.status(self.lbl_save.toolTip().replace("\n", " "))
+
+    def resolve_conflict(self):
+        """The file changed on disk behind our back: ask what to do. True once resolved."""
+        if not self._conflict or not self.proj_path:
+            return True
+        m = QMessageBox(self)
+        m.setIcon(QMessageBox.Warning)
+        m.setWindowTitle("Project changed on disk")
+        m.setText(f"“{self.project_name()}” was changed by another program while it was open here.")
+        m.setInformativeText("Your changes are safe in a recovery copy. Keep your version (it replaces the file), "
+                             "load the version on disk, or save yours as a separate copy?")
+        mine = m.addButton("Keep my version", QMessageBox.AcceptRole)
+        disk = m.addButton("Load the version on disk", QMessageBox.ActionRole)
+        copy = m.addButton("Save mine as a copy…", QMessageBox.ActionRole)
+        m.addButton("Decide later", QMessageBox.RejectRole)
+        m.setDefaultButton(mine)
+        m.exec()
+        b = m.clickedButton()
+        if b is mine:
+            return self._save_to(self.proj_path, force=True)
+        if b is disk:
+            self.keep_unsaved_as_recovery()
+            self._conflict = False
+            self.open_project(self.proj_path, recover=False)
+            return True
+        if b is copy:
+            return self.save_project_as()
+        return False
+
+    # ---- explicit saving
+    def _save_to(self, path, new_path=False, force=False):
+        self.save_timer.stop()
+        self.save_max_timer.stop()
+        self.writer.wait_idle(15)
+        doc, snap, old = self.state_doc(), self.snapshot(), self.proj_path
+        d = self.document()
+        if new_path and old != path:                       # a separate copy gets its own identity
+            d["meta"] = {k: v for k, v in (d.get("meta") or {}).items() if k not in ("id", "created")}
+        text = json.dumps(store.prepare_document(d, store.project_name(path)), ensure_ascii=False)
+        try:
+            sig = store.save_project_text(path, text, None if (new_path or force) else self._disk_sig)
+        except store.ConflictError as e:
+            self._conflict, self.save_error = True, str(e)
+            self.set_save_state("conflict")
+            return self.resolve_conflict()
+        except Exception as e:
+            self.save_error = str(e)
+            self.set_save_state("failed")
+            QMessageBox.warning(self, "Could not save", str(e) if isinstance(e, store.ProjectError)
+                                else f"The project could not be saved:\n{e}")
+            return False
+        if old != path:
+            if old is None:
+                store.discard_recovery(None)
+            self.proj_path = path
+            self._extra = {k: v for k, v in d.items() if k not in PROJECT_KEYS}
+            store.add_recent(path)
+            self.track_project()
+        self._disk_sig, self._saved_doc, self._last_doc, self._saved = sig, doc, doc, snap
+        self._done_gen = self._gen
+        self._conflict = False
+        self.rec_timer.stop()
+        store.discard_recovery(path)
+        self.set_save_state("saved")
+        self.update_title()
+        self.status("Project saved.")
+        self.save_thumbnail()
+        return True
+
+    def projects_dir(self):
+        d = store.get_projects_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        return d
 
     def save_project(self):
         if not self.proj_path:
-            p, _ = QFileDialog.getSaveFileName(self, "Save project", "", "Clip Studio project (*.clipproj)")
+            p, _ = QFileDialog.getSaveFileName(self, "Save project", os.path.join(self.projects_dir(), "Untitled.clipproj"),
+                                               PROJECT_FILTER)
             if not p:
                 return False
-            self.proj_path = p if p.endswith(".clipproj") else p + ".clipproj"
-        try:
-            with open(self.proj_path, "w", encoding="utf-8") as f:
-                json.dump(self.project_dict(), f)
-        except Exception as e:
-            QMessageBox.warning(self, "Could not save", f"The project could not be saved:\n{e}")
+            return self._save_to(self._project_target(p), new_path=True)
+        return self._save_to(self.proj_path)
+
+    def _project_target(self, p):
+        """Normalise a path from a save dialog. A new file put straight into the projects folder gets its own
+        project folder there, like projects made from the dashboard."""
+        p = p if p.endswith(".clipproj") else p + ".clipproj"
+        root = self.projects_dir()
+        if not os.path.exists(p) and os.path.normcase(os.path.dirname(os.path.abspath(p))) == os.path.normcase(root):
+            nm = store.unique_name(root, store.safe_name(store.project_name(p)))
+            try:
+                for sub in ("recovery", "cache"):
+                    os.makedirs(os.path.join(root, nm, sub))
+                p = os.path.join(root, nm, nm + ".clipproj")
+            except OSError:
+                pass
+        return p
+
+    def save_project_as(self):
+        """Save a copy under a new name and carry on editing the copy."""
+        start = os.path.join(self.projects_dir(), (self.project_name() + " copy" if self.proj_path else "Untitled")
+                             + ".clipproj")
+        p, _ = QFileDialog.getSaveFileName(self, "Save project as", start, PROJECT_FILTER)
+        if not p:
             return False
-        self._saved = self.snapshot()
+        p = self._project_target(p)
+        if self.proj_path and os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(self.proj_path)):
+            return self.save_project()
+        if self.proj_path and not self._conflict:
+            self.autosave(wait=True)                      # the original keeps everything done so far
+        return self._save_to(p, new_path=True)
+
+    # ---- project menu (header)
+    def project_menu(self):
+        m = QMenu(self)
+        has = bool(self.proj_path)
+        m.addAction("Rename…", self.rename_project).setEnabled(has)
+        m.addAction("Open project folder", lambda: reveal_in_file_manager(self.proj_path)).setEnabled(has)
+        m.addSeparator()
+        m.addAction("Save\tCtrl+S", self.save_project)
+        m.addAction("Save as…\tCtrl+Shift+S", self.save_project_as)
+        m.addSeparator()
+        m.addAction("New project…\tCtrl+N", self.new_project)
+        m.addAction("Back to projects", self.show_dashboard)
+        m.exec(self.b_proj.mapToGlobal(QPoint(0, self.b_proj.height() + 2)))
+
+    def rename_project(self):
+        if not self.proj_path:
+            return self.save_project()
+        name, ok = QInputDialog.getText(self, "Rename project", "New name:", QLineEdit.Normal, self.project_name())
+        name = (name or "").strip()
+        if not ok or not name or name == self.project_name():
+            return False
+        if not self.leave_project("rename"):
+            return False
+        try:
+            new = store.rename_project(self.proj_path, name)
+        except store.ProjectError as e:
+            QMessageBox.warning(self, "Could not rename", str(e))
+            return False
+        self.proj_path = new
+        self._disk_sig = store.file_signature(new)
+        self.track_project()
+        self.set_save_state("saved")
         self.update_title()
-        self.status("Project saved.")
+        self.status(f"Renamed to “{self.project_name()}”.")
         return True
 
-    def autosave(self):
-        try:
-            if self.is_dirty():
-                os.makedirs(os.path.dirname(self.AUTOSAVE), exist_ok=True)
-                with open(self.AUTOSAVE, "w", encoding="utf-8") as f:
-                    json.dump(self.project_dict(), f)
-        except Exception:
-            pass
-        self.update_title()
+    def new_project(self):
+        if self.on_dashboard():
+            return self.dashboard.new_project()
+        name, ok = QInputDialog.getText(self, "New project", "Name your project:", QLineEdit.Normal,
+                                        self.dashboard.suggest_name())
+        if ok and name.strip():
+            self.create_and_open(name.strip())
 
-    def offer_restore(self):
-        if not os.path.exists(self.AUTOSAVE):
+    def create_and_open(self, name, data=None):
+        """Make a new project in the projects folder and open it (the current one is saved first)."""
+        if not self.on_dashboard() and (self.proj_path or self.is_dirty()) and not self.leave_project("new"):
+            return False
+        try:
+            p = store.create_project(name, data=data)
+        except store.ProjectError as e:
+            QMessageBox.warning(self, "Could not create the project", str(e))
+            return False
+        return self.open_project(p, recover=False)
+
+    # ---- thumbnails for the dashboard
+    def render_thumbnail(self, width=384):
+        """The preview at the playhead as a small picture (video frames come from the players or the timeline
+        thumbnails, so nothing is decoded here)."""
+        W, H = self.W, self.H
+        img = QImage(width, max(1, round(width * H / W)), QImage.Format_RGB32)
+        img.fill(QColor("#000000"))
+        swapped = []
+        for ss in self.slots.values():
+            for s in ss:
+                if s.cid is None or not s.vitem.isVisible():
+                    continue
+                sink = s.vitem.videoSink()
+                fr = sink.videoFrame() if sink is not None else None
+                pm = QPixmap.fromImage(fr.toImage()) if fr is not None and fr.isValid() else self._thumb_frame(s.cid)
+                if pm is None or pm.isNull():
+                    continue
+                sz = s.vitem.size()
+                s.pitem.setPixmap(pm)
+                s.pitem.setTransform(QTransform.fromScale(sz.width() / pm.width(), sz.height() / pm.height()))
+                s.pitem.setPos(s.vitem.pos())
+                s.pitem.setOpacity(s.vitem.opacity())
+                s.pitem.show()
+                s.vitem.hide()
+                swapped.append(s)
+        hidden = [i for i in (self.xbox, self.empty_txt) if i is not None and i.isVisible()]
+        for i in hidden:
+            i.hide()
+        pen = self.canvas.pen()
+        self.canvas.setPen(QPen(Qt.NoPen))
+        p = QPainter(img)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        try:
+            self.scene.render(p, QRectF(img.rect()), QRectF(0, 0, W, H))
+            if not swapped and self._blank(img):          # nothing under the playhead: use the first picture
+                c = next((c for c in sorted(self.clips, key=lambda c: (c.start, -c.track))
+                          if c.kind in ("video", "image") and c.track <= 2), None)
+                pm = (QPixmap(c.path) if c.kind == "image" else self._thumb_frame(c.id)) if c else None
+                if pm is not None and not pm.isNull():
+                    sz = pm.size().scaled(img.size(), Qt.KeepAspectRatio)
+                    p.drawPixmap(QRectF((img.width() - sz.width()) / 2, (img.height() - sz.height()) / 2,
+                                        sz.width(), sz.height()), pm, QRectF(pm.rect()))
+        finally:
+            p.end()
+            self.canvas.setPen(pen)
+            for i in hidden:
+                i.show()
+            for s in swapped:
+                s.pitem.hide()
+                s.vitem.show()
+        return img
+
+    def _thumb_frame(self, cid):
+        c = next((c for c in self.clips if c.id == cid), None)
+        if c is None or c.path not in THUMBS:
+            return None
+        iv, files = THUMBS[c.path]
+        t = c.inp + min(max(0.0, self.t - c.start), c.dur) if c.start <= self.t <= c.end else c.inp
+        return pix_of(files[max(0, min(len(files) - 1, int(t / iv)))])
+
+    @staticmethod
+    def _blank(img):
+        small = img.scaled(8, 8)
+        return all(small.pixelColor(x, y).value() < 12 for x in range(8) for y in range(8))
+
+    def save_thumbnail(self):
+        if not self.proj_path:
             return
-        r = QMessageBox.question(self, "Restore your work?", "Clip Studio found unsaved work from last time "
-                                 "(it was closed without saving). Restore it?",
-                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if r == QMessageBox.Yes:
-            self.open_project(self.AUTOSAVE, restore=True)
-        else:
-            try:
-                os.remove(self.AUTOSAVE)
-            except Exception:
-                pass
+        try:
+            dst = store.thumbnail_path(self.proj_path)
+            if not self.clips:
+                if os.path.exists(dst):
+                    os.remove(dst)
+                return
+            img = self.render_thumbnail()
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            tmp = dst + ".tmp"
+            if img.save(tmp, "JPG", 85):
+                os.replace(tmp, dst)
+            self._last_thumb = time.time()
+        except Exception as e:
+            store.log_error(f"Could not save the thumbnail of {self.proj_path}", e)
+
+    # ---- start-up, closing, opening
+    def offer_restore(self):
+        """At start-up: offer Clip Studio's old autosave (once), never-saved work and projects a crash left behind."""
+        if os.path.exists(self.AUTOSAVE):
+            r = QMessageBox.question(self, "Restore your work?", "Parrot Studio found unsaved work from Clip Studio "
+                                     "(it was closed without saving). Restore it as a new project?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            data = None
+            if r == QMessageBox.Yes:
+                try:
+                    data = store.load_project_file(self.AUTOSAVE)
+                except store.ProjectError as e:
+                    QMessageBox.warning(self, "Could not restore", f"The unsaved work could not be read:\n{e}")
+            try:                                          # offered once: set it aside, never delete it
+                os.replace(self.AUTOSAVE, self.AUTOSAVE + ".old")
+            except OSError as e:
+                store.report_problem("Could not set the old autosave file aside", e)
+            if data is not None:
+                self.create_and_open("Recovered project", data)
+                return
+        info = store.find_recovery(None)
+        if info is not None:
+            r = QMessageBox.question(self, "Restore your work?", "Parrot Studio found work from last time that was "
+                                     "never saved to a project. Restore it as a new project?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            data = None
+            if r == QMessageBox.Yes:
+                try:
+                    data = store.load_recovery(info)
+                except store.ProjectError as e:
+                    QMessageBox.warning(self, "Could not restore", f"The unsaved work could not be read:\n{e}")
+            store.discard_recovery(None, info)
+            if data is not None:
+                self.create_and_open("Recovered project", data)
+                return
+        for s in self.unclean_sessions:
+            p = s.get("project") if isinstance(s, dict) else None
+            if p and os.path.isfile(p) and store.has_recovery(p):
+                r = QMessageBox.question(self, "Parrot Studio closed unexpectedly",
+                                         f"Parrot Studio didn't close properly while “{store.project_name(p)}” "
+                                         "was open. Its unsaved changes were recovered. Open the project now?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if r == QMessageBox.Yes:
+                    self.open_project(p)
+                break
+        self.unclean_sessions = []
+        probs = store.take_problems()
+        if probs:
+            self.status(probs[-1], 12000)
 
     def closeEvent(self, ev):
-        if self.is_dirty():
-            m = QMessageBox(self)
-            m.setIcon(QMessageBox.Question)
-            m.setWindowTitle("Unsaved changes")
-            m.setText("Save your project before closing?")
-            sv = m.addButton("Save", QMessageBox.AcceptRole)
-            ds = m.addButton("Don't save", QMessageBox.DestructiveRole)
-            ds.setObjectName("danger")
-            ds.style().unpolish(ds)
-            ds.style().polish(ds)
-            cn = m.addButton("Cancel", QMessageBox.RejectRole)
-            m.setDefaultButton(sv)
-            m.exec()
-            if m.clickedButton() is cn:
+        if self.proj_path:
+            if not self.leave_project("close"):
                 ev.ignore()
                 return
-            if m.clickedButton() is sv and not self.save_project():
-                ev.ignore()
-                return
+        elif self.is_dirty() and not self.ask_save_untitled("Save your project before closing?"):
+            ev.ignore()
+            return
         for proc in (getattr(self, "exp_proc", None), (self.conv_cur or {}).get("proc")):
             try:
                 if proc:
                     proc.kill()
             except Exception:
                 pass
-        try:
-            os.remove(self.AUTOSAVE)
-        except Exception:
-            pass
+        for t in (self.save_timer, self.save_max_timer, self.rec_timer):
+            t.stop()
+        self.writer.wait_idle(10)
+        if not self.proj_path:
+            store.discard_recovery(None)       # closed on purpose: never-saved work was saved or let go
+        self.writer.stop()
         shutil.rmtree(self.work, ignore_errors=True)
         ev.accept()
 
-    def open_project(self, path=None, restore=False):
+    def offer_recovery(self, p):
+        """If p has recovered unsaved changes, ask what to do. Returns (info, data) to restore, or None."""
+        try:
+            info = store.find_recovery(p)
+        except Exception as e:
+            store.report_problem(f"Could not check {p} for recovered changes", e)
+            info = None
+        probs = store.take_problems()
+        if probs:
+            self.status(probs[-1], 12000)
+        if info is None:
+            return None
+        when = time.strftime("%d %b %Y at %H:%M", time.localtime(info.saved_at)).lstrip("0")
+        m = QMessageBox(self)
+        m.setIcon(QMessageBox.Question)
+        m.setWindowTitle("Recover unsaved changes?")
+        m.setText(f"“{store.project_name(p)}” has changes that were never saved to the project file.")
+        m.setInformativeText(f"They were recovered on {when}. Restore them, or open the last saved version? "
+                             "If you keep them for later, you'll be asked again next time.")
+        rb = m.addButton("Restore changes", QMessageBox.AcceptRole)
+        m.addButton("Keep for later", QMessageBox.RejectRole)
+        db = m.addButton("Discard", QMessageBox.DestructiveRole)
+        db.setObjectName("danger")
+        db.style().unpolish(db)
+        db.style().polish(db)
+        m.setDefaultButton(rb)
+        m.exec()
+        b = m.clickedButton()
+        try:
+            if b is rb:
+                return info, store.load_recovery(info)
+            if b is db:
+                store.discard_recovery(p, info)
+            else:
+                store.keep_recovery(info)
+        except store.ProjectError as e:
+            QMessageBox.warning(self, "Could not recover", f"The recovered changes could not be read:\n{e}")
+        except OSError as e:
+            store.report_problem(f"Could not update the recovery file of {p}", e)
+        return None
+
+    def open_failed(self, p, e):
+        """Explain why a project didn't open; offer its backup when there is a good one. Returns data or None."""
+        bak = getattr(e, "backup", None)
+        if bak:
+            m = QMessageBox(self)
+            m.setIcon(QMessageBox.Warning)
+            m.setWindowTitle("Could not open")
+            m.setText(f"That project file could not be read:\n{e}")
+            m.setInformativeText("Parrot Studio kept a backup from the save before. Open the backup instead? "
+                                 "(The damaged file is replaced the next time the project is saved.)")
+            ob = m.addButton("Open the backup", QMessageBox.AcceptRole)
+            m.addButton("Cancel", QMessageBox.RejectRole)
+            m.setDefaultButton(ob)
+            m.exec()
+            if m.clickedButton() is ob:
+                try:
+                    return store.load_project_file(bak)
+                except store.ProjectError as e2:
+                    e = e2
+            else:
+                return None
+        QMessageBox.warning(self, "Could not open", f"That project file could not be read:\n{e}")
+        return None
+
+    def open_project(self, path=None, restore=False, recover=True):
+        """Open a .clipproj (any location, old Clip Studio files too). No path: ask with a file dialog.
+        restore=True loads the file as unsaved, untitled work. recover=False skips the recovered-changes prompt."""
         p = path if isinstance(path, str) else ""
         if not p:
-            if self.is_dirty() and QMessageBox.question(
-                    self, "Open project", "Your current project has unsaved changes. Open another project anyway?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
-                return
-            p, _ = QFileDialog.getOpenFileName(self, "Open project", "", "Clip Studio project (*.clipproj)")
+            if self.on_dashboard():
+                return self.dashboard.open_existing()
+            if not self.leave_project("open"):
+                return False
+            start = os.path.dirname(self.proj_path) if self.proj_path else self.projects_dir()
+            p, _ = QFileDialog.getOpenFileName(self, "Open project", start, PROJECT_FILTER)
+        elif (not restore and self.proj_path and not self.on_dashboard()
+              and os.path.normcase(os.path.abspath(p)) != os.path.normcase(os.path.abspath(self.proj_path))):
+            if not self.leave_project("open"):
+                return False
         if not p:
-            return
+            return False
+        p = p if restore else os.path.abspath(p)
         try:
-            with open(p, encoding="utf-8") as f:
-                d = json.load(f)
+            d = store.load_project_file(p)
             clips = [Clip(**c) for c in d["clips"]]
         except Exception as e:
-            QMessageBox.warning(self, "Could not open", f"That project file could not be read:\n{e}")
-            return
-        self.proj_path = None if restore else p
-        self.libview.clear()
-        self.lib = []
-        for l in d.get("lib", []):
-            if os.path.exists(l["path"]):
-                self.add_to_library(l["path"], ask=False)
-        self.clips = clips
-        for c in self.clips:
-            if c.nat:
-                self.rerender_caption(c)
-        self.W, self.H = d["W"], d["H"]
-        if d.get("substyle"):
-            self.apply_sub_style(d["substyle"])
-        for name, wh in CANVAS.items():
-            if wh == (self.W, self.H):
-                self.cb_canvas.blockSignals(True)
-                self.cb_canvas.setCurrentText(name)
-                self.cb_canvas.blockSignals(False)
-        self.build_canvas()
-        self.sel = None
-        self.undo.clear()
-        self.redo.clear()
-        self.t = 0.0
-        self.after_edit()
-        self._saved = "[]" if restore else self.snapshot()
+            d = self.open_failed(p, e)
+            if d is None:
+                return False
+            clips = [Clip(**c) for c in d["clips"]]
+        saved_snap = json.dumps([c.to_dict() for c in clips])
+        rec = self.offer_recovery(p) if recover and not restore else None
+        if rec is not None:
+            try:
+                rclips = [Clip(**c) for c in rec[1]["clips"]]
+                d, clips = rec[1], rclips
+            except Exception as e:
+                QMessageBox.warning(self, "Could not recover", f"The recovered changes could not be used:\n{e}")
+                rec = None
+        if self.playing:
+            self.toggle_play()
+        for t in (self.save_timer, self.save_max_timer, self.rec_timer):
+            t.stop()
+        self._opening = True
+        try:
+            self.proj_path = None if restore else p
+            self.libview.clear()
+            self.lib = []
+            for l in d.get("lib", []):
+                if isinstance(l, dict) and os.path.exists(l.get("path", "")):
+                    self.add_to_library(l["path"], ask=False)
+            self.clips = clips
+            for c in self.clips:
+                if c.nat:
+                    self.rerender_caption(c)
+            self.W, self.H = int(d["W"]), int(d["H"])
+            if d.get("substyle"):
+                self.apply_sub_style(d["substyle"])
+            else:                                    # a new project starts with the user's default subtitle look
+                self.apply_sub_style(self.sub_factory())
+                self.load_sub_defaults()
+            for name, wh in CANVAS.items():
+                if wh == (self.W, self.H):
+                    self.cb_canvas.blockSignals(True)
+                    self.cb_canvas.setCurrentText(name)
+                    self.cb_canvas.blockSignals(False)
+            self.build_canvas()
+            self.sel = None
+            self.undo.clear()
+            self.redo.clear()
+            self.t = 0.0
+            self.after_edit()
+        finally:
+            self._opening = False
+        self._extra = {k: v for k, v in d.items() if k not in PROJECT_KEYS}
+        self._disk_sig = None if restore else store.file_signature(p)
+        self._conflict, self.save_error = False, ""
+        doc = self.state_doc()
+        self._last_doc = doc
+        self._saved_doc = None if (restore or rec) else doc
+        self._gen += 1
+        self._done_gen, self._rec_gen = self._gen, 0
+        self._saved = "[]" if restore else (saved_snap if rec else self.snapshot())
+        self._last_thumb = 0.0
+        if rec is not None:
+            self.undo = [saved_snap]                  # Ctrl+Z goes back to the last saved version
+            info = rec[0]
+            self.write_recovery(force=True)           # a fresh snapshot of the restored state first ...
+            if info.kept:                             # ... then the kept one can go
+                self.writer.submit(("kept", info.path), lambda: store.discard_recovery(p, info))
+            if self.auto_timer.isActive():
+                self.save_timer.start()
+            self.set_save_state("pending")
+        else:
+            self.set_save_state("" if restore else "saved")
+        if not restore:
+            store.add_recent(p)
+            self.track_project()
+        self.show_editor()
         self.update_title()
         QTimer.singleShot(0, self.zoom_fit)
         for c in self.clips:
             if c.hasaudio and c.kind in ("audio", "video"):
                 threading.Thread(target=compute_wave, args=(c.path,), daemon=True).start()
+        self.status("Recovered changes restored. Ctrl+Z goes back to the saved version." if rec else
+                    f"Opened “{self.project_name()}”.")
         missing = sorted({os.path.basename(c.path) for c in self.clips if not c.nat and c.kind != "sub"
                           and c.path and not os.path.exists(c.path)})
         if missing:
             QMessageBox.warning(self, "Some media is missing", "These files could not be found, so their clips "
                                 "will be blank:\n\n" + "\n".join(missing[:12]))
+        return True
 
     # ------------------------------------------------------------------ export
     def export(self):
@@ -4591,6 +5344,27 @@ QWidget#header { background: #1B1C1F; border-bottom: 1px solid #26272C; }
 QWidget#transport { background: #1B1C1F; border-top: 1px solid #26272C; }
 QWidget#toolbar { background: #1B1C1F; border-bottom: 1px solid #26272C; }
 QLabel#title { font-size: 14px; font-weight: 600; color: #E8E9EC; padding-right: 8px; }
+QLabel#crumb { color: #4F5158; font-size: 14px; padding: 0 2px; }
+QPushButton#projectName { background: transparent; border: 1px solid transparent; color: #E8E9EC; font-size: 13px;
+              padding: 4px 8px; }
+QPushButton#projectName:hover { background: #2A2B30; }
+QPushButton#projectName:pressed { background: #232428; }
+QPushButton#saveState { background: transparent; border: none; color: #767880; font-size: 11px; padding: 4px 6px;
+              min-height: 0; }
+QPushButton#saveState:hover { color: #C9CBD1; }
+QPushButton#saveState[state="saved"] { color: #7FBFA0; }
+QPushButton#saveState[state="failed"], QPushButton#saveState[state="conflict"] { color: #F07A7E; }
+QPushButton#link { background: transparent; border: none; color: #7FE5FF; padding: 0 4px; min-height: 0; }
+QPushButton#link:hover { color: #B5F0FF; text-decoration: underline; }
+
+/* ---------- project dashboard ---------- */
+QWidget#dashboard, QWidget#dashBody { background: #17181B; }
+QLabel#dashTitle { font-size: 20px; font-weight: 600; color: #E8E9EC; }
+QLabel#dashMeta { color: #767880; }
+QLabel#dashPath { color: #C9CBD1; }
+QLabel#emptyTitle { font-size: 16px; font-weight: 600; color: #E8E9EC; }
+QFrame#recoveryBanner { background: #2B2414; border: 1px solid #4A3B17; border-radius: 6px; }
+QLabel#bannerText { color: #F2D9A0; }
 QLabel#time { font-family: "Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono", monospace;
               font-size: 13px; color: #E8E9EC; }
 QLabel#hint { color: #767880; font-size: 11px; }
@@ -4808,18 +5582,18 @@ def main():
         sys.exit(1)
     app = QApplication(sys.argv)
 
+    app.setApplicationName(APP_TITLE)
+
     def _log_err(et, ev, tb):  # errors inside Qt callbacks are otherwise invisible on Windows
-        import traceback
-        try:
-            os.makedirs(os.path.join(os.path.expanduser("~"), ".clip_studio"), exist_ok=True)
-            with open(os.path.join(os.path.expanduser("~"), ".clip_studio", "error.log"), "a", encoding="utf-8") as f:
-                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + "".join(traceback.format_exception(et, ev, tb)) + "\n")
-        except Exception:
-            pass
+        store.log_error("Unhandled error", ev.with_traceback(tb) if ev is not None else et())
         sys.__excepthook__(et, ev, tb)
     sys.excepthook = _log_err
     dark_theme(app)
     w = MainWindow()
+    w.track_session = True
+    w.unclean_sessions = store.acquire_session_lock()     # earlier sessions that crashed
+    app.aboutToQuit.connect(store.release_session_lock)
+    w.show_dashboard()
     w.show()
     QTimer.singleShot(400, w.offer_restore)
     sys.exit(app.exec())
