@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QColorDialog, QPlainTextEdit, QFontComboBox, QFra
                                QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsItem, QGraphicsPixmapItem, QGraphicsPathItem, QGraphicsSimpleTextItem, QSlider, QTabWidget, QProgressBar,
                                QSplitter, QScrollArea, QFileDialog, QMessageBox, QScrollBar, QMenu, QGroupBox,
                                QFormLayout, QCheckBox, QProgressDialog, QAbstractSpinBox, QLineEdit, QInputDialog,
-                               QGridLayout, QStyledItemDelegate, QProxyStyle, QStyle, QStackedWidget)
+                               QGridLayout, QStyledItemDelegate, QProxyStyle, QStyle, QStackedWidget, QSizePolicy)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 
@@ -2665,6 +2665,42 @@ PROJECT_FILTER = "Parrot Studio project (*.clipproj)"
 PROJECT_KEYS = ("substyle", "W", "H", "lib", "clips")      # what project_dict() writes; other keys are kept as-is
 
 
+class ElideButton(QPushButton):
+    """A push button whose text is elided to fit, so a long project name never widens the window.
+    Its minimum is a fixed 80 px; it asks for the full text width up to maximumWidth()."""
+    PAD = 44                      # padding + chevron icon + spacing
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.full = text
+
+    def set_full_text(self, text):
+        self.full = text
+        self.updateGeometry()
+        self._elide()
+
+    def _bold_metrics(self):
+        f = QFont(self.font())
+        f.setWeight(QFont.DemiBold)
+        return QFontMetrics(f)
+
+    def sizeHint(self):
+        sh = super().sizeHint()
+        return QSize(min(self.maximumWidth(), self._bold_metrics().horizontalAdvance(self.full) + self.PAD), sh.height())
+
+    def minimumSizeHint(self):
+        return QSize(80, super().minimumSizeHint().height())
+
+    def _elide(self):
+        t = self._bold_metrics().elidedText(self.full, Qt.ElideRight, max(20, self.width() - self.PAD))
+        if t != self.text():
+            self.setText(t)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._elide()
+
+
 class Relay(QObject):
     """Runs a function on the GUI thread (worker threads emit; the queued connection delivers)."""
     call = Signal(object)
@@ -2960,6 +2996,8 @@ class MainWindow(QMainWindow):
         for cb in self.findChildren(QComboBox):      # roomier popup rows (font lists keep their own preview)
             if not isinstance(cb, QFontComboBox):
                 cb.setItemDelegate(QStyledItemDelegate(cb))
+        self.fit_header(self.width())
+        self.load_props()                            # inspector starts in its "no clip selected" state
 
     # ------------------------------------------------------------------ misc UI
     def status(self, msg, ms=6000):
@@ -3074,8 +3112,10 @@ class MainWindow(QMainWindow):
         hd.addSpacing(12)
         hd.addWidget(sep())
         hd.addSpacing(4)
-        self.b_proj = QPushButton("Untitled")
+        self.b_proj = ElideButton("Untitled")
         self.b_proj.setObjectName("projectName")
+        self.b_proj.setMinimumWidth(80)
+        self.b_proj.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.b_proj.setToolTip("Project options")
         self.b_proj.setCursor(Qt.PointingHandCursor)
         self.b_proj.setIcon(mk_icon("chev_down", "#A6A8B0"))
@@ -3086,7 +3126,6 @@ class MainWindow(QMainWindow):
         hd.addWidget(self.b_proj)
         self.name_edit = QLineEdit()                          # inline rename (F2), shown in place of the name
         self.name_edit.setObjectName("projectNameEdit")
-        self.name_edit.setFixedWidth(240)
         self.name_edit.hide()
         self.name_edit.installEventFilter(self)
         self.name_edit.returnPressed.connect(self.finish_rename)
@@ -3104,6 +3143,7 @@ class MainWindow(QMainWindow):
         self.cb_canvas.setMinimumWidth(170)
         self.cb_canvas.currentTextChanged.connect(self.set_canvas)
         self.lbl_canvas = field("Canvas")
+        self.lbl_canvas.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)   # never adds to the minimum
         hd.addWidget(self.lbl_canvas)
         hd.addWidget(self.cb_canvas)
         hd.addSpacing(12)
@@ -3112,6 +3152,7 @@ class MainWindow(QMainWindow):
         self.cb_fps.setToolTip("Frame rate of the exported video")
         self.cb_fps.setFixedWidth(72)
         self.lbl_fps = field("Frame rate")
+        self.lbl_fps.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         hd.addWidget(self.lbl_fps)
         hd.addWidget(self.cb_fps)
         hd.addSpacing(12)
@@ -3227,11 +3268,17 @@ class MainWindow(QMainWindow):
         if n != getattr(self, "_hint_n", None):
             self._hint_n = n
             self.sb_hint.setText(hint_html(HINTS[:n]))
-        narrow = self.width() < 1180                    # header: make room for the project name
-        self.b_proj.setMaximumWidth(200 if narrow else 320)
-        self.lbl_canvas.setVisible(not narrow)
-        self.lbl_fps.setVisible(not narrow)
+        self.fit_header()
         self.update_title()
+
+    def fit_header(self, width=None):
+        """Below 1180 px the header drops the Canvas / Frame rate captions and caps the project name at 200 px."""
+        narrow = (width or self.width()) < 1180
+        self.b_proj.setMaximumWidth(200 if narrow else 320)
+        for lab in (self.lbl_canvas, self.lbl_fps):
+            lab.setVisible(not narrow)
+            if not narrow:
+                lab.setMinimumWidth(lab.sizeHint().width())
 
     def showEvent(self, ev):
         super().showEvent(ev)
@@ -3283,7 +3330,7 @@ class MainWindow(QMainWindow):
         def tab(title, rows, note=""):
             w = QWidget()
             f = QFormLayout(w)
-            f.setContentsMargins(0, 12, 4, 0)
+            f.setContentsMargins(12, 12, 12, 0)
             f.setHorizontalSpacing(12)
             f.setVerticalSpacing(8)
             for lab, wdg in rows:
@@ -3324,13 +3371,19 @@ class MainWindow(QMainWindow):
         self.goto_tab("Fade")
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(12, 12, 12, 0)
+        lay.setContentsMargins(0, 12, 0, 0)        # tab text, pane line and fields all start at x=12
         lay.setSpacing(4)
         eyebrow = QLabel("Selected clip")
         eyebrow.setObjectName("eyebrow")
         self.p_eyebrow = eyebrow
-        lay.addWidget(eyebrow)
-        lay.addWidget(self.p_name)
+        top = QWidget()
+        tl_ = QVBoxLayout(top)
+        tl_.setContentsMargins(12, 0, 12, 0)
+        tl_.setSpacing(4)
+        tl_.addWidget(eyebrow)
+        tl_.addWidget(self.p_name)
+        self.p_top = top
+        lay.addWidget(top)
         lay.addSpacing(8)
         lay.addWidget(tabs, 1)
         # shown instead of the tabs while nothing is selected
@@ -3379,7 +3432,7 @@ class MainWindow(QMainWindow):
     def build_caption_panel(self):
         w = QWidget()
         v = QVBoxLayout(w)
-        v.setContentsMargins(0, 12, 4, 0)
+        v.setContentsMargins(12, 12, 12, 0)
         v.setSpacing(8)
         v.addWidget(QLabel("Caption text"))
         self.cap_edit = QPlainTextEdit()
@@ -3443,7 +3496,7 @@ class MainWindow(QMainWindow):
         if fams and self.sel is not None and self.sel.nat:
             self.cap_font.setCurrentFont(QFont(fams[0]))
         elif fams:
-            self.status(f"Loaded font {fams[0]}. Select a caption to use it.")
+            self.status(f"Loaded font {fams[0]}. Pick it in a Font list (subtitles), or select a caption to use it.")
 
     # ------------------------------------------------------------------ subtitles
     def goto_tab(self, name):
@@ -3455,7 +3508,7 @@ class MainWindow(QMainWindow):
     def build_sub_panel(self):
         w = QWidget()
         v = QVBoxLayout(w)
-        v.setContentsMargins(0, 12, 4, 0)
+        v.setContentsMargins(12, 12, 12, 0)
         v.setSpacing(8)
         v.addWidget(QLabel("Subtitle text"))
         self.sub_edit = QPlainTextEdit()
@@ -3566,6 +3619,10 @@ class MainWindow(QMainWindow):
         self._form_style(sf)
         sf.setContentsMargins(0, 8, 0, 0)
         sf.addRow("Font", self.sub_font)
+        b_font2 = QPushButton("Load font file...")
+        b_font2.setToolTip("Add a font from a .ttf / .otf file for subtitles and captions")
+        b_font2.clicked.connect(self.load_font)
+        sf.addRow("", b_font2)
         r2 = QHBoxLayout()
         r2.addWidget(self.sub_bold)
         r2.addWidget(self.sub_upper)
@@ -3958,9 +4015,7 @@ class MainWindow(QMainWindow):
         n = len(self.selected())
         if c is None:
             vis = set()
-        elif n > 1:
-            vis = {"Fade"}
-        elif c.kind == "sub":
+        elif c.kind == "sub":          # with several clips selected, the tabs follow the primary one (it is edited)
             vis = {"Subtitle"}
         elif c.kind == "audio":
             vis = {"Fade", "Audio"}
@@ -3972,9 +4027,8 @@ class MainWindow(QMainWindow):
                 vis.add("Audio")
         self.ptabs.setVisible(bool(vis))
         self.p_empty.setVisible(not vis)
-        self.p_name.setVisible(bool(vis))
+        self.p_top.setVisible(bool(vis))
         self.p_eyebrow.setText(f"{n} clips selected" if n > 1 else "Selected clip")
-        self.p_eyebrow.setVisible(bool(vis))
         for i in range(self.ptabs.count()):
             self.ptabs.setTabVisible(i, self.ptabs.tabText(i) in vis)
         if vis and self.ptabs.tabText(self.ptabs.currentIndex()) not in vis:
@@ -4639,11 +4693,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{nm}{note} \u2013 {APP_TITLE}")
         b = getattr(self, "b_proj", None)
         if b is not None:
-            f = QFont(b.font())
-            f.setWeight(QFont.DemiBold)
-            shown = QFontMetrics(f).elidedText(nm, Qt.ElideRight, b.maximumWidth() - 40)
-            b.setText(shown)
-            b.setMinimumWidth(min(b.maximumWidth(), QFontMetrics(f).horizontalAdvance(shown) + 44))
+            b.set_full_text(nm)
             b.setToolTip(f"{nm}\nProject options" if self.proj_path else "Project options")
             if not self.proj_path:
                 self.set_save_state("untitled" if self.is_dirty() else "")
@@ -5095,6 +5145,7 @@ class MainWindow(QMainWindow):
         if self.on_dashboard():
             return
         self.name_edit.setText(self.project_name())
+        self.name_edit.setFixedWidth(min(320, max(self.b_proj.width(), 160)))   # about where the name was
         self.b_proj.hide()
         self.name_edit.show()
         self.name_edit.setFocus(Qt.OtherFocusReason)
