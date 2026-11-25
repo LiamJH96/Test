@@ -1227,12 +1227,19 @@ def test_persisted_paths_unchanged(cs, fake_home):
     PARROT_STUDIO_CONFIG_DIR); the old ~/.clip_studio locations are still read (legacy autosave, caches)."""
     base = os.path.join(fake_home, ".clip_studio")
     assert cs.MainWindow.AUTOSAVE == os.path.join(base, "autosave.clipproj")     # legacy autosave still offered
-    assert cs.EMO_DIR == os.path.join(base, "emoji")
-    assert cs.CAP_DIR == os.path.join(base, "captions")
     store = getattr(cs, "store", None)
     if store is None:                                                          # pre-round-2 app
+        assert cs.EMO_DIR == os.path.join(base, "emoji")
+        assert cs.CAP_DIR == os.path.join(base, "captions")
         assert cs.MainWindow.SUB_DEF_FILE == os.path.join(base, "sub_defaults.json")
         return
+    if hasattr(store, "cache_dir"):                                            # caches: local cache dir
+        cache = os.path.abspath(store.cache_dir())
+        assert os.path.abspath(cs.EMO_DIR) == os.path.join(cache, "emoji")
+        assert os.path.abspath(cs.CAP_DIR) == os.path.join(cache, "captions")
+        assert not cache.startswith(base), "caches must not stay in the legacy folder"
+        if hasattr(cs, "LEGACY_EMO_DIR"):                                      # old emoji downloads still used
+            assert cs.LEGACY_EMO_DIR == os.path.join(base, "emoji")
     cfg = os.environ["PARROT_STUDIO_CONFIG_DIR"]
     assert os.path.abspath(store.config_dir()) == os.path.abspath(cfg)
     assert os.path.abspath(cs.MainWindow.SUB_DEF_FILE) == os.path.join(os.path.abspath(cfg), "sub_defaults.json")
