@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 from PySide6 import QtWidgets
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QFile, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen,
                            QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QSizePolicy,
@@ -44,6 +44,24 @@ def reveal_in_file_manager(path):
     except Exception as e:
         store.log_error(f"Could not show {path} in the file manager", e)
         return False
+
+
+BIN = "Recycle Bin" if sys.platform.startswith("win") else "Trash"
+
+
+def move_to_trash(path):
+    """Move a file or folder to the Recycle Bin / Trash. True if it worked."""
+    if not sys.platform.startswith("win") and sys.platform != "darwin":
+        # freedesktop.org home trash: Qt only uses it if it exists, and a fresh account may not have one yet
+        base = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "Trash")
+        try:
+            for sub in ("files", "info"):
+                os.makedirs(os.path.join(base, sub), mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+    ok = QFile.moveToTrash(path)
+    ok = ok[0] if isinstance(ok, tuple) else ok
+    return bool(ok) and not os.path.exists(path)
 
 
 def nice_path(p):
@@ -949,16 +967,26 @@ class Dashboard(QWidget):
         if info.missing:
             self.forget(info)
             return False
-        if not self.confirm("Delete project?", f"“{info.name}” will be deleted permanently.",
-                            "Your imported media files are not deleted.", "Delete", danger=True):
+        what = "Its project folder" if info.managed else "The project file"
+        if not self.confirm("Delete project?", f"“{info.name}” will be moved to the {BIN}.",
+                            f"{what} can be restored from there. Your imported media files are not touched.",
+                            "Delete", danger=True):
             return False
         idx = next((i for i, c in enumerate(self.grid.cards) if c.info.path == info.path), 0)
         try:
-            left = store.delete_project(info.path)
-        except store.ProjectError as e:
-            self.warn("Could not delete", str(e))
-            self.refresh()
-            return False
+            left = store.delete_project(info.path, trash=move_to_trash)
+        except store.ProjectError:
+            if not self.confirm("Delete permanently?", f"“{info.name}” couldn't be moved to the {BIN}.",
+                                "Delete it permanently instead? This can't be undone. Your imported media files "
+                                "are not touched.", "Delete permanently", danger=True):
+                self.refresh()
+                return False
+            try:
+                left = store.delete_project(info.path)
+            except store.ProjectError as e2:
+                self.warn("Could not delete", str(e2))
+                self.refresh()
+                return False
         if left:
             self.warn("Project deleted", "The project was deleted. Files you added to its folder yourself were "
                       "kept:\n\n" + "\n".join(os.path.basename(x) for x in left[:10]))

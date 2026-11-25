@@ -1340,18 +1340,28 @@ def test_project_save_load_roundtrip(win, media, modals, tmp_path, cs):
         # dirty marker
         w2.sel = w2.clips[0]
         w2.delete_sel()
-        assert w2.is_dirty() and w2.windowTitle().endswith("*")
+        assert w2.is_dirty()
+        if not hasattr(w2, "lbl_save"):                 # round 1: '*' in the title; round 2: header save indicator
+            assert w2.windowTitle().endswith("*")
     finally:
         dispose_window(w2)
-    # header buttons
+    # header buttons (round 1) / project-name menu (round 2)
+    def trigger(key, menu_text):
+        if hasattr(win, "b_proj"):
+            modals.menu_pick = menu_text
+            n_menus = len(modals.menus)
+            win.b_proj.click()
+            assert len(modals.menus) == n_menus + 1 and modals.menu_pick is None, f"{menu_text!r} not in the menu"
+        else:
+            find_button(win, key).click()
     win.sel = win.clips[0]
     win.delete_sel()
-    find_button(win, "save").click()            # already has a path: saves silently
+    trigger("save", "Save")                     # already has a path: saves silently
     assert len(json.load(open(path))["clips"]) == len(before) - 1
     modals.open_path = path
     modals.question_answer = __import__("PySide6.QtWidgets", fromlist=["QMessageBox"]).QMessageBox.Yes
-    find_button(win, "open").click()
-    assert len(win.clips) == len(before) - 1
+    trigger("open", "Open project\u2026")
+    assert len(win.clips) == len(before) - 1 and win.proj_path == path
 
 
 def test_open_project_errors(win, media, modals, tmp_path):
@@ -1698,7 +1708,31 @@ def test_status_and_title(win, media):
     assert "Parrot Studio" in win.windowTitle() or win.windowTitle().startswith("Clip Studio")   # round 2 rename
     add(win, media["video"])
     win.update_title()
-    assert win.windowTitle().endswith("*")
+    if hasattr(win, "lbl_save"):     # round 2: "<name> – Parrot Studio", unsaved state shown in the header
+        t = win.windowTitle()
+        assert t.endswith("Parrot Studio") and "*" not in t
+        assert "not saved" in t.lower() or win.lbl_save.text()
+    else:
+        assert win.windowTitle().endswith("*")
+
+
+def test_project_menu_actions_and_shortcuts(win, modals, tmp_path, media):
+    """Round 2: Open / Save moved from header buttons into the project-name menu; the shortcuts stay."""
+    if not hasattr(win, "b_proj"):
+        pytest.skip("round-1 header")
+    sc = all_shortcuts(win)
+    for k in ("Ctrl+S", "Ctrl+Shift+S", "Ctrl+O", "Ctrl+N"):
+        assert norm_key(k) in sc, f"{k} shortcut missing"
+    win.b_proj.click()
+    texts = [t.replace("&", "") for t in modals.menus[-1][1]]
+    for want in ("Save", "Save as", "Open project", "New project", "Back to projects", "Rename"):
+        assert any(t.startswith(want) for t in texts), f"{want!r} not in project menu {texts}"
+    add(win, media["video"])
+    modals.save_path = str(tmp_path / "via_menu")
+    modals.menu_pick = "Save"
+    win.b_proj.click()
+    assert any(c[0] == "save" for c in modals.calls), "Save in the project menu did nothing"
+    assert win.proj_path and os.path.isfile(win.proj_path)
 
 
 def test_icons_render(cs, qapp):

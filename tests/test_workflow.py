@@ -527,10 +527,9 @@ CORRUPT = {
     # the ones below get past json.load and fail half-way through open_project
     "no_size": json.dumps({"clips": [], "lib": []}),
     "size_is_text": json.dumps({"clips": [], "W": "wide", "H": 1920}),
-    "lib_entry_without_path": json.dumps({"clips": [], "lib": [{"name": "x"}], "W": 1080, "H": 1920}),
     "clip_with_bad_types": json.dumps({"clips": [{"start": "abc", "dur": None, "track": 9}], "W": 1080, "H": 1920}),
 }
-HALF_LOADS = {"lib_entry_without_path", "clip_with_bad_types"}    # no_size / size_is_text: fixed in round 2
+HALF_LOADS = {"clip_with_bad_types"}    # no_size / size_is_text / lib entry: fixed in round 2
 
 
 @pytest.mark.parametrize("case", list(CORRUPT))
@@ -560,6 +559,15 @@ def test_corrupt_project_file_leaves_current_project_untouched(ed, modals, rich_
     assert not errors, f"exception escaped open_project: {errors[0]!r}"
     assert any(c[0] in ("warning", "critical", "msgbox") for c in modals.calls[n:]), "no error shown to the user"
     assert (w.snapshot(), json.dumps(w.lib, sort_keys=True), w.proj_path, w.W, w.H) == before
+
+
+def test_project_with_a_damaged_library_entry_still_opens(ed, modals, tmp_path):
+    """A library entry without a path is skipped; the rest of the project opens (no exception, no half state)."""
+    p = str(tmp_path / "badlib.clipproj")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"clips": [], "lib": [{"name": "x"}, 5], "W": 1920, "H": 1080}, f)
+    assert ed.open_project(p) is not False
+    assert os.path.abspath(ed.proj_path) == os.path.abspath(p) and (ed.W, ed.H) == (1920, 1080) and ed.lib == []
 
 
 # =============================================================================== responsiveness

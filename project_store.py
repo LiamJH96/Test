@@ -63,6 +63,22 @@ def config_dir():
     return os.path.join(os.path.expanduser("~"), ".config", "parrot_studio")
 
 
+def cache_dir():
+    """Regenerable caches (emoji pictures, rendered captions, UI images): local, never roamed or backed up.
+    Windows: %LOCALAPPDATA%\\Parrot Studio\\cache; elsewhere $XDG_CACHE_HOME/parrot_studio (~/.cache/parrot_studio).
+    PARROT_STUDIO_CACHE_DIR overrides it; with only PARROT_STUDIO_CONFIG_DIR set (tests) it is <config>/cache."""
+    env = os.environ.get("PARROT_STUDIO_CACHE_DIR")
+    if env:
+        return os.path.abspath(env)
+    if os.environ.get("PARROT_STUDIO_CONFIG_DIR"):
+        return os.path.join(config_dir(), "cache")
+    if _IS_WIN:
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.join(base, APP_NAME, "cache")
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "parrot_studio")
+
+
 def legacy_dir():
     """Where Clip Studio kept its settings and caches."""
     return os.path.join(os.path.expanduser("~"), ".clip_studio")
@@ -600,13 +616,35 @@ def rename_project(path, new_name):
     return new_path
 
 
-def delete_project(path):
+def delete_project(path, trash=None):
     """Delete a project. Only files Parrot Studio made are removed; media and other files are never touched.
+    trash: optional function(path) -> bool that moves a file or folder to the Recycle Bin / Trash. With it, a
+    project folder (or, for a project kept elsewhere, its .clipproj and .bak) goes to the bin; if that fails,
+    ProjectError is raised and nothing is deleted (the caller asks before deleting permanently).
     Returns a list of anything left behind (e.g. the user's own files inside the project folder)."""
     path = os.path.abspath(path)
     managed = is_managed(path)
     folder = os.path.dirname(path)
     rec, th = recovery_dir(path), thumbnail_path(path)
+    if trash is not None:
+        targets = [folder] if managed else [f for f in (path, path + ".bak") if os.path.isfile(f)]
+        for t in targets:
+            ok = False
+            try:
+                ok = bool(trash(t))
+            except Exception as e:
+                log_error(f"Moving {t} to the Recycle Bin failed", e)
+            if not ok:
+                raise ProjectError("The project could not be moved to the Recycle Bin.", path)
+        try:                                # our own helper data for it (outside the folder) goes for good
+            if not managed and os.path.isdir(rec):
+                shutil.rmtree(rec)
+            if not managed and os.path.isfile(th):
+                os.remove(th)
+        except OSError as e:
+            report_problem(f"Could not tidy up the cached data of {path}", e)
+        remove_recent(path)
+        return []
     try:
         for f in (path, path + ".bak"):
             if os.path.isfile(f):
