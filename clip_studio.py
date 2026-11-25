@@ -617,22 +617,36 @@ def build_sub_ass(caps, st, W, H):
 
 
 
+def swatch_icon(color):
+    """A small rounded colour square, for colour buttons."""
+    dpr = 2
+    pm = QPixmap(16 * dpr, 16 * dpr)
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(QColor(255, 255, 255, 60), 1))
+    p.setBrush(QColor(color))
+    p.drawRoundedRect(QRectF(0.5, 0.5, 15, 15), 3, 3)
+    p.end()
+    return QIcon(pm)
+
+
 class ColorButton(QPushButton):
     changed = Signal()
 
     def __init__(self, color):
         super().__init__()
         self.color = color
+        self.setObjectName("swatch")
         self.setFixedWidth(110)
+        self.setIconSize(QSize(16, 16))
         self.clicked.connect(self.pick)
         self.paint()
 
     def paint(self):
-        c = QColor(self.color)
-        lum = c.red() * 0.3 + c.green() * 0.59 + c.blue() * 0.11
+        self.setIcon(swatch_icon(self.color))
         self.setText(self.color.upper())
-        self.setStyleSheet(f"background:{self.color};color:{'black' if lum > 130 else 'white'};"
-                           f"border:1px solid #666;padding:3px;")
 
     def set_color(self, color):
         self.color = color
@@ -863,7 +877,7 @@ class SubItem(QGraphicsItem):
         p.restore()
         if not win.playing:
             m = self.handle()
-            blue = QColor(127, 229, 255)
+            blue = QColor("#5B9BFF")
             p.setPen(QPen(blue, m / 6, Qt.DashLine))
             p.setBrush(Qt.NoBrush)
             p.drawRect(self.box)
@@ -1208,6 +1222,7 @@ class Timeline(QWidget):
         self.press_t = 0.0
         self.ext_lib = self.ext_g = None
         self.hold = 0.0
+        self._snap_t = None       # time the dragged clip / edge snapped to (drawn as a thin line)
         self._cache, self._ver = None, 0
         self._tl = time.perf_counter()
         self._auto = QTimer(self)
@@ -1215,7 +1230,8 @@ class Timeline(QWidget):
         self._auto.timeout.connect(self._auto_tick)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
-        self.setMinimumHeight(RULER + TH * len(TRACKS) + 4)
+        self.th = TH              # track height: grows/shrinks with the timeline (see resizeEvent)
+        self.setMinimumHeight(RULER + 40 * len(TRACKS) + 4)
         self.setFocusPolicy(Qt.StrongFocus)
         BUS.wave.connect(self._invalidate)
         # fonts and pens made once, not on every repaint
@@ -1244,6 +1260,10 @@ class Timeline(QWidget):
         self._ver += 1
         self.update()
 
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self.th = max(40, min(64, (self.height() - RULER - 4) // len(TRACKS)))
+
     # coordinates
     def tx(self, t):
         return LBL + (t - self.t0) * self.pps
@@ -1252,11 +1272,11 @@ class Timeline(QWidget):
         return (x - LBL) / self.pps + self.t0
 
     def row_at(self, y):
-        r = int((y - RULER) // TH)
+        r = int((y - RULER) // self.th)
         return r if 0 <= r < len(TRACKS) else None
 
     def clip_rect(self, c):
-        return QRectF(self.tx(c.start), RULER + c.track * TH + 3, c.dur * self.pps, TH - 6)
+        return QRectF(self.tx(c.start), RULER + c.track * self.th + 3, c.dur * self.pps, self.th - 6)
 
     def clip_at(self, pos):
         for c in reversed(self.win.clips):
@@ -1285,8 +1305,12 @@ class Timeline(QWidget):
         m.setTitle("Transition")
         order = ["Dip to black"] + [t for t in TRANS if t not in ("Dip to black", "None")] + ["None"]
         for t in order:
+            if t == "None":
+                m.addSeparator()
             lab = "No transition" if t == "None" else (t + "  (default)" if t == "Dip to black" else t)
-            a = m.addAction(("\u2713  " if t == c.ttype else "     ") + lab)
+            a = m.addAction(lab)
+            a.setCheckable(True)
+            a.setChecked(t == c.ttype)
             a.triggered.connect(lambda _=False, t=t: self.set_trans_on(c, t))
         m.exec(gpos)
 
@@ -1303,6 +1327,7 @@ class Timeline(QWidget):
         return False
 
     def snap(self, t, others_exclude, pix=7):
+        self._snap_t = None
         if not self.snap_on or (QApplication.keyboardModifiers() & Qt.AltModifier):
             return t
         ex = others_exclude if isinstance(others_exclude, (list, tuple, set)) else (others_exclude,)
@@ -1314,6 +1339,8 @@ class Timeline(QWidget):
         for cnd in cands:
             if abs(cnd - t) < bd:
                 best, bd = cnd, abs(cnd - t)
+        if best != t:
+            self._snap_t = best
         return best
 
     # painting (everything except the playhead is cached; during playback only the playhead is redrawn)
@@ -1321,9 +1348,9 @@ class Timeline(QWidget):
         w = self.win
         sig = tuple((c.id, c.start, c.dur, c.inp, c.track, c.fin, c.fout, c.ttype, c.tdur, c.name, c.text, c.kind)
                     for c in w.clips)
-        return (self.size().width(), self.size().height(), self.devicePixelRatioF(), self.t0, self.pps,
+        return (self.size().width(), self.size().height(), self.th, self.devicePixelRatioF(), self.t0, self.pps,
                 tuple(id(x) for x in w._sels), id(w.sel), id(self.hov), id(self.hj), self.mode, self.mq, self.plan and (self.plan[0], self.plan[2]),
-                self.drop_hint, sig, len(THUMBS), len(WAVES), self._ver)
+                self.drop_hint, sig, len(THUMBS), len(WAVES), self._ver, self._snap_t)
 
     def playhead_update(self):
         x = self.tx(self.win.t)
@@ -1363,18 +1390,18 @@ class Timeline(QWidget):
         # tracks: plain lanes (no zebra stripes) and a header column with a colour chip per track type
         p.setFont(self.f_head)
         for i, (nm, kind) in enumerate(TRACKS):
-            y = RULER + i * TH
-            p.fillRect(LBL, y, w - LBL, TH, TLC["lane_main"] if nm == "Video" else TLC["lane"])
+            y = RULER + i * self.th
+            p.fillRect(LBL, y, w - LBL, self.th, TLC["lane_main"] if nm == "Video" else TLC["lane"])
             p.setPen(TLC["lane_line"])
-            p.drawLine(LBL, y + TH - 1, w, y + TH - 1)
-            p.fillRect(0, y, LBL, TH, TLC["head"])
+            p.drawLine(LBL, y + self.th - 1, w, y + self.th - 1)
+            p.fillRect(0, y, LBL, self.th, TLC["head"])
             p.setPen(TLC["head_edge"])
-            p.drawLine(0, y + TH - 1, LBL, y + TH - 1)
-            p.fillRect(QRectF(0, y + 6, 3, TH - 12), TRACK_Q[TRACK_CHIP[i]][2])
+            p.drawLine(0, y + self.th - 1, LBL, y + self.th - 1)
+            p.fillRect(QRectF(0, y + 6, 3, self.th - 12), TRACK_Q[TRACK_CHIP[i]][2])
             p.setPen(TLC["head_text_main"] if nm == "Video" else TLC["head_text"])
-            p.drawText(14, y, LBL - 18, TH, Qt.AlignVCenter | Qt.AlignLeft, nm)
+            p.drawText(14, y, LBL - 18, self.th, Qt.AlignVCenter | Qt.AlignLeft, nm)
         p.setPen(TLC["head_edge"])
-        p.drawLine(LBL - 1, RULER, LBL - 1, RULER + TH * nt)
+        p.drawLine(LBL - 1, RULER, LBL - 1, RULER + self.th * nt)
         # ruler: major ticks with short labels, minor ticks in between
         p.fillRect(0, 0, w, RULER, TLC["ruler"])
         p.setPen(TLC["head_edge"])
@@ -1400,7 +1427,7 @@ class Timeline(QWidget):
                 p.drawText(QRectF(x + 4, 2, 90, RULER - 10), Qt.AlignLeft | Qt.AlignVCenter, fmt_ruler(t, step))
             k += 1
         # clips
-        p.setClipRect(LBL, RULER, w - LBL, TH * nt)
+        p.setClipRect(LBL, RULER, w - LBL, self.th * nt)
         dragging = self.win.sel if self.mode == "move" else None
         order = [c for c in self.win.clips if c is not dragging] + ([dragging] if dragging else [])
         fm = self.fm_small
@@ -1506,6 +1533,10 @@ class Timeline(QWidget):
                 p.drawLine(QPointF(cx, cy - 4.5), QPointF(cx, cy + 4.5))
             p.setRenderHint(QPainter.Antialiasing, False)
         acc = TLC["accent"]
+        if self.mode in ("move", "trimL", "trimR") and self._snap_t is not None:
+            xs = int(self.tx(self._snap_t))
+            p.setPen(QPen(acc, 1))
+            p.drawLine(xs, RULER, xs, RULER + self.th * nt)
         if self.mode == "marquee" and self.mq:
             q = QRectF(self.mq[0], self.mq[1]).normalized()
             p.setPen(QPen(acc, 1))
@@ -1514,11 +1545,11 @@ class Timeline(QWidget):
         if self.mode == "move" and self.plan and self.win.sel:
             kind, ref, st = self.plan
             c = self.win.sel
-            y = RULER + c.track * TH
+            y = RULER + c.track * self.th
             if kind in ("before", "after"):          # insertion marker between clips
                 x = self.tx(ref.start if kind == "before" else ref.end)
                 p.setPen(QPen(acc, 2))
-                p.drawLine(QPointF(x, y + 2), QPointF(x, y + TH - 2))
+                p.drawLine(QPointF(x, y + 2), QPointF(x, y + self.th - 2))
                 p.setBrush(acc)
                 p.setPen(Qt.NoPen)
                 p.setRenderHint(QPainter.Antialiasing, True)
@@ -1527,10 +1558,10 @@ class Timeline(QWidget):
             elif abs(st - c.start) > 1e-3:           # it will slide to the nearest free spot
                 p.setPen(QPen(acc, 1.5, Qt.DashLine))
                 p.setBrush(self.c_accent_fill)
-                p.drawRect(QRectF(self.tx(st), y + 3, c.dur * self.pps, TH - 6))
+                p.drawRect(QRectF(self.tx(st), y + 3, c.dur * self.pps, self.th - 6))
         p.setClipping(False)
         if not self.win.clips:
-            area = QRectF(LBL, RULER, w - LBL, TH * nt)
+            area = QRectF(LBL, RULER, w - LBL, self.th * nt)
             cy = area.center().y()
             p.setFont(self.f_empty)
             p.setPen(TLC["empty_title"])
@@ -1546,7 +1577,7 @@ class Timeline(QWidget):
             p.setPen(QPen(acc, 1.5, Qt.DashLine))
             p.setBrush(self.c_accent_fill)
             p.setRenderHint(QPainter.Antialiasing, True)
-            p.drawRoundedRect(QRectF(self.tx(t0), RULER + tr * TH + 3, d * self.pps, TH - 6), 4, 4)
+            p.drawRoundedRect(QRectF(self.tx(t0), RULER + tr * self.th + 3, d * self.pps, self.th - 6), 4, 4)
             p.setRenderHint(QPainter.Antialiasing, False)
 
     # mouse
@@ -1676,7 +1707,7 @@ class Timeline(QWidget):
             if abs(ns - raw) < 1e-9:  # start did not snap: try snapping the end instead
                 ns = self.snap(raw + d0, c) - d0
             ns = max(0.0, ns)
-            row = max(0, min(len(TRACKS) - 1, int((pos.y() - RULER) // TH)))
+            row = max(0, min(len(TRACKS) - 1, int((pos.y() - RULER) // self.th)))
             if TRACKS[row][1] == KIND_TRACK.get(c.kind, "v"):
                 c.track = row
             c.start = ns                     # free movement; overlaps are sorted out when you let go
@@ -1824,12 +1855,14 @@ class Timeline(QWidget):
         self._multi = self._collapse = self.mq = None
         self.plan = None
         self.mode = None
+        self._snap_t = None
         self.update()
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key_Escape and self.mode in ("move", "trimL", "trimR"):   # cancel a drag
             self._auto.stop()
             self.mode, self.plan = None, None
+            self._snap_t = None
             self.win.restore(self._pre)
             self.win.status("Move cancelled.")
             return
@@ -1858,7 +1891,9 @@ class Timeline(QWidget):
         if c.kind != "audio":
             sub = m.addMenu("Transition from previous clip")
             for t in TRANS:
-                sub.addAction(t, lambda t=t: self.win.set_trans(t))
+                a = sub.addAction(t, lambda t=t: self.win.set_trans(t))
+                a.setCheckable(True)
+                a.setChecked(t == c.ttype)
         m.exec(ev.globalPos())
 
     def leaveEvent(self, ev):
@@ -2038,9 +2073,20 @@ class LibraryList(QListWidget):
         super().paintEvent(ev)
         if self.count() == 0:
             p = QPainter(self.viewport())
-            p.setPen(QColor(120, 120, 135))
-            p.drawText(self.viewport().rect().adjusted(14, 0, -14, 0), Qt.AlignCenter | Qt.TextWordWrap,
-                       "Your media shows up here.\n\nClick Import media, or drop video, image and audio files onto this window.")
+            r = self.viewport().rect().adjusted(16, 0, -16, 0)
+            f = QFont(self.font())
+            f.setPixelSize(13)
+            f.setWeight(QFont.DemiBold)
+            p.setFont(f)
+            p.setPen(QColor("#A6A8B0"))
+            top = r.center().y() - 28
+            p.drawText(QRect(r.left(), top, r.width(), 20), Qt.AlignCenter, "Your media shows up here.")
+            f.setPixelSize(12)
+            f.setWeight(QFont.Normal)
+            p.setFont(f)
+            p.setPen(QColor("#767880"))
+            p.drawText(QRect(r.left(), top + 28, r.width(), 60), Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
+                       "Click Import media, or drop video, image and audio files onto this window.")
 
     def startDrag(self, actions):
         it = self.currentItem()
@@ -2067,6 +2113,7 @@ class TransList(QListWidget):
         self.addItems(TRANS[1:])
         self.setDragEnabled(False)
         self.setObjectName("transitions")
+        self.viewport().setCursor(Qt.OpenHandCursor)
         self._press = self._drag = None
 
     def mousePressEvent(self, ev):
@@ -2093,6 +2140,7 @@ class TransList(QListWidget):
                 ghost.show()
                 self._drag = (it.text(), ghost)
                 self.viewport().grabMouse()
+                self.viewport().setCursor(Qt.ClosedHandCursor)
                 return
         super().mouseMoveEvent(ev)
 
@@ -2103,6 +2151,7 @@ class TransList(QListWidget):
             ghost.hide()
             ghost.deleteLater()
             self.viewport().releaseMouse()
+            self.viewport().setCursor(Qt.OpenHandCursor)
             tl = self.window().tl
             lp = tl.mapFromGlobal(ev.globalPosition().toPoint())
             if tl.rect().contains(lp):
@@ -2324,13 +2373,13 @@ class TransformBox(QGraphicsItem):
     def paint(self, p, opt, widget=None):
         if not self.c:
             return
-        pen = QPen(QColor(127, 229, 255), 2)
+        pen = QPen(QColor("#5B9BFF"), 2)
         pen.setCosmetic(True)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
         p.drawRect(self.rect())
         if self.snapx or self.snapy:
-            gp = QPen(QColor(255, 80, 200), 1, Qt.DashLine)
+            gp = QPen(QColor("#FF5AC8"), 1, Qt.DashLine)
             gp.setCosmetic(True)
             p.setPen(gp)
             if self.snapx:
@@ -2338,7 +2387,9 @@ class TransformBox(QGraphicsItem):
             if self.snapy:
                 p.drawLine(QPointF(0, self.win.H / 2), QPointF(self.win.W, self.win.H / 2))
         hs = self.hs()
-        p.setPen(Qt.NoPen)
+        hp = QPen(QColor("#111214"), 1)       # dark rim so the handles show on white video too
+        hp.setCosmetic(True)
+        p.setPen(hp)
         p.setBrush(QColor(255, 255, 255))
         for pt in self.corners().values():
             p.drawRect(QRectF(pt.x() - hs / 2, pt.y() - hs / 2, hs, hs))
@@ -2470,6 +2521,16 @@ class PreviewView(QGraphicsView):
 
 # ----------------------------------------------------------------------------- main window
 
+HINTS = [("Space", "play"), ("S", "split"), ("Del", "delete"), ("Ctrl+Z", "undo"), ("Ctrl+wheel", "zoom"),
+         ("Ctrl+click", "select several"), ("Alt", "no snapping"), ("Shift", "place freely"), ("Esc", "cancel a drag")]
+
+
+def hint_html(items):
+    """Status bar shortcut hints: the key a little brighter than what it does."""
+    return "&nbsp;&nbsp;&nbsp;".join(f"<span style='color:#C9CBD1'>{k}</span> <span style='color:#767880'>{d}</span>"
+                                     for k, d in items)
+
+
 def scrolled(w):
     """Put a panel page in a scroll area, so tall pages never force a tall window."""
     sa = QScrollArea()
@@ -2577,8 +2638,13 @@ class MainWindow(QMainWindow):
             cb.addWidget(wdg)
         self.conv_box.hide()
         ll.addWidget(self.conv_box)
-        ll.addWidget(b_imp)
-        ll.addWidget(b_add)
+        b_imp.setIcon(mk_icon("plus", "#C9CBD1"))
+        b_imp.setIconSize(QSize(16, 16))
+        lr = QHBoxLayout()
+        lr.setSpacing(8)
+        lr.addWidget(b_imp)
+        lr.addWidget(b_add)
+        ll.addLayout(lr)
         tr_w = QWidget()
         tl_ = QVBoxLayout(tr_w)
         tl_.setContentsMargins(12, 12, 12, 12)
@@ -2681,7 +2747,8 @@ class MainWindow(QMainWindow):
         main.setStretchFactor(1, 0)
         main.setCollapsible(0, False)
         main.setCollapsible(1, False)
-        main.setSizes([600, 340])
+        main.setSizes([600, 360])
+        self.main_split = main
         root = QWidget()
         rv = QVBoxLayout(root)
         rv.setContentsMargins(0, 0, 0, 0)
@@ -2689,8 +2756,9 @@ class MainWindow(QMainWindow):
         rv.addWidget(self.header)
         rv.addWidget(main, 1)
         self.setCentralWidget(root)
-        self.sb_hint = QLabel("Space: play   S: split   Del: delete   Ctrl+Z: undo   Ctrl+wheel: zoom   "
-                              "Ctrl+click: select several   Alt: no snapping   Shift: place freely   Esc: cancel a drag")
+        self.sb_hint = QLabel()
+        self.sb_hint.setTextFormat(Qt.RichText)
+        self.sb_hint.setText(hint_html(HINTS))
         self.statusBar().addPermanentWidget(self.sb_hint)
         self.status("Welcome! Import media to get started.")
 
@@ -2740,6 +2808,9 @@ class MainWindow(QMainWindow):
         BUS.done.connect(self.on_export_done)
         self.prog = None
         self.cancel_flag = False
+        for cb in self.findChildren(QComboBox):      # roomier popup rows (font lists keep their own preview)
+            if not isinstance(cb, QFontComboBox):
+                cb.setItemDelegate(QStyledItemDelegate(cb))
 
     # ------------------------------------------------------------------ misc UI
     def status(self, msg, ms=6000):
@@ -2767,25 +2838,34 @@ class MainWindow(QMainWindow):
             return f
         self.b_play = btn("", "Play / pause  (Space)", self.toggle_play, "play", "play", (36, 36))
         b_start = btn("", "Go to the start  (Home)", lambda: self.set_time(0), "round", "start", (28, 28))
-        self.lbl_time = QLabel("00:00.00 / 00:00.00")
+        self.lbl_time = QLabel()
         self.lbl_time.setObjectName("time")
-        self.lbl_time.setMinimumWidth(200)
-        self.lbl_time.setAlignment(Qt.AlignCenter)
+        self.lbl_time.setTextFormat(Qt.RichText)
+        self.lbl_time.setText(self.time_html())
+        self.lbl_time.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.transport_bar = QWidget()
         self.transport_bar.setObjectName("transport")
         self.transport_bar.setFixedHeight(44)
         self.transport = QHBoxLayout(self.transport_bar)
         self.transport.setContentsMargins(12, 4, 12, 4)
         self.transport.setSpacing(8)
+        # time on the left, play controls centred, preview zoom on the right
+        self.transport.addWidget(self.lbl_time)
         self.transport.addStretch(1)
         self.transport.addWidget(b_start)
         self.transport.addWidget(self.b_play)
-        self.transport.addWidget(self.lbl_time)
+        self.transport.addStretch(1)
         self.b_zoomv = btn("Zoom video", "Zoom the preview in on the clip so you can see it big  (Z).  "
                            "Mouse wheel zooms, right-drag moves around. Only changes the preview, not the export.",
                            self.zoom_clip, icon="fit")
-        self.transport.addWidget(self.b_zoomv)
-        self.transport.addStretch(1)
+        zr = QWidget()
+        zl = QHBoxLayout(zr)
+        zl.setContentsMargins(0, 0, 0, 0)
+        zl.addStretch(1)
+        zl.addWidget(self.b_zoomv)
+        zr.setMinimumWidth(self.lbl_time.sizeHint().width())   # same width both sides keeps Play centred
+        self.lbl_time.setMinimumWidth(self.lbl_time.sizeHint().width())
+        self.transport.addWidget(zr)
 
         self.editbar_w = QWidget()
         self.editbar_w.setObjectName("toolbar")
@@ -2801,7 +2881,7 @@ class MainWindow(QMainWindow):
         eb.addWidget(btn("Split", "Cut the selected clip in two at the red playhead  (S)", self.split, icon="split"))
         eb.addWidget(btn("Delete", "Delete the selected clip  (Del)", self.delete_sel, icon="trash"))
         eb.addWidget(btn("Add gap", "Insert empty space at the playhead: everything after it moves later",
-                         self.insert_gap, icon="plus"))
+                         lambda: self.insert_gap(), icon="plus"))   # lambda: clicked() would pass False as the time
         eb.addWidget(btn("Delete && close gap", "Delete the clip and pull later clips on that track back  "
                          "(Shift+Del)", self.ripple_delete, icon="ripple"))
         eb.addSpacing(4)
@@ -2965,9 +3045,19 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         self.view.fit()
+        n = 9 if self.width() >= 1500 else (6 if self.width() >= 1100 else 4)   # leave room for status messages
+        if n != getattr(self, "_hint_n", None):
+            self._hint_n = n
+            self.sb_hint.setText(hint_html(HINTS[:n]))
 
     def showEvent(self, ev):
         super().showEvent(ev)
+        if not getattr(self, "_split_done", False):   # first show: share the height sensibly on small screens too
+            self._split_done = True
+            tot = sum(self.main_split.sizes())
+            if tot > 0:
+                b = max(self.main_split.widget(1).minimumSizeHint().height(), min(360, int(tot * 0.42)))
+                self.main_split.setSizes([tot - b, b])
         self.view.fit()
 
     def set_canvas(self, name):
@@ -3582,8 +3672,8 @@ class MainWindow(QMainWindow):
                 self.cap_size.setValue(c.csize)
                 self.cap_bold.setValue(eff_bold(c))
                 self.cap_box.setChecked(c.cuse)
-                self.cap_bcol.setStyleSheet(f"background:{c.cbox};color:#000;")
-                self.cap_tcol.setStyleSheet(f"background:{c.ccol};color:#fff;")
+                self.cap_bcol.setIcon(swatch_icon(c.cbox))
+                self.cap_tcol.setIcon(swatch_icon(c.ccol))
             issub = bool(c and c.kind == "sub")
             self.sub_edit.setEnabled(issub)
             for b in getattr(self, "sub_quick", ()):
@@ -3689,7 +3779,13 @@ class MainWindow(QMainWindow):
             pm = QPixmap(tmp)
         if pm.isNull():
             pm = QPixmap(120, 68)
-            pm.fill(QColor(44, 150, 96) if info["kind"] == "audio" else QColor(60, 60, 70))
+            if info["kind"] == "audio":
+                pm.fill(QColor(TRACK_STYLE["audio"][0]))
+                p = QPainter(pm)
+                p.drawPixmap(48, 22, mk_icon("audio", TRACK_STYLE["audio"][3], 24).pixmap(24, 24))
+                p.end()
+            else:
+                pm.fill(QColor("#2A2B30"))
         return QIcon(pm.scaled(120, 68, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def start_bg(self, info):
@@ -3719,6 +3815,7 @@ class MainWindow(QMainWindow):
                                    "original is never changed. The clip is greyed out in the library until it's ready.")
             yes = box.addButton("Convert to SDR", QMessageBox.AcceptRole)
             box.addButton("Use as is", QMessageBox.RejectRole)
+            box.setDefaultButton(yes)
             box.exec()
             if box.clickedButton() is yes:
                 self.convert_hdr(info)
@@ -3989,8 +4086,12 @@ class MainWindow(QMainWindow):
         self.update_preview(force=True)
         self.update_label()
 
+    def time_html(self):
+        return (f"<span style='color:#E8E9EC'>{fmt_t(self.t)}</span>"
+                f"<span style='color:#767880'>&nbsp;/&nbsp;{fmt_t(self.total())}</span>")
+
     def update_label(self):
-        self.lbl_time.setText(f"{fmt_t(self.t)} / {fmt_t(self.total())}")
+        self.lbl_time.setText(self.time_html())
 
     def set_time(self, t):
         self.t = max(0.0, t)
@@ -4043,7 +4144,7 @@ class MainWindow(QMainWindow):
             else:
                 self.tl.playhead_update()
             self.update_preview()
-            txt = f"{fmt_t(self.t)} / {fmt_t(self.total())}"
+            txt = self.time_html()
             if txt != self.lbl_time.text():
                 self.lbl_time.setText(txt)
 
@@ -4258,8 +4359,12 @@ class MainWindow(QMainWindow):
             m.setWindowTitle("Unsaved changes")
             m.setText("Save your project before closing?")
             sv = m.addButton("Save", QMessageBox.AcceptRole)
-            m.addButton("Don't save", QMessageBox.DestructiveRole)
+            ds = m.addButton("Don't save", QMessageBox.DestructiveRole)
+            ds.setObjectName("danger")
+            ds.style().unpolish(ds)
+            ds.style().polish(ds)
             cn = m.addButton("Cancel", QMessageBox.RejectRole)
+            m.setDefaultButton(sv)
             m.exec()
             if m.clickedButton() is cn:
                 ev.ignore()
@@ -4367,6 +4472,9 @@ class MainWindow(QMainWindow):
         self.cancel_flag = False
         self.exp_T = T
         self.prog = QProgressDialog("Exporting...", "Cancel", 0, 1000, self)
+        self.prog.setWindowTitle("Export")
+        self.prog.setLabelText("Exporting video\u2026")
+        self.prog.setMinimumWidth(400)
         self.prog.setWindowModality(Qt.WindowModal)
         self.prog.canceled.connect(lambda: setattr(self, "cancel_flag", True))
         self.prog.show()
@@ -4416,6 +4524,7 @@ class MainWindow(QMainWindow):
             m.setInformativeText(getattr(self, "export_out", ""))
             op = m.addButton("Show in folder", QMessageBox.AcceptRole)
             m.addButton("Close", QMessageBox.RejectRole)
+            m.setDefaultButton(op)
             m.exec()
             if m.clickedButton() is op:
                 out = getattr(self, "export_out", "")
@@ -4503,7 +4612,7 @@ QPushButton#primary:hover { background: #4886EC; border-color: #4886EC; }
 QPushButton#primary:pressed { background: #2F67C4; border-color: #2F67C4; }
 QPushButton#primary:disabled { background: #26334A; border-color: #26334A; color: #6F7D96; }
 
-QPushButton#danger { background: transparent; border: 1px solid #5A2A2D; color: #F07A7E; }
+QPushButton#danger, QMessageBox QPushButton#danger { background: transparent; border: 1px solid #5A2A2D; color: #F07A7E; }
 QPushButton#danger:hover { background: #3A1D20; border-color: #E5484D; color: #F59EA1; }
 QPushButton#danger:pressed { background: #4A2226; }
 
