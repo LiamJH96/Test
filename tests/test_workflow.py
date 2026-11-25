@@ -269,8 +269,6 @@ def test_undo_redo_chain_restores_every_state_exactly(ed, modals, rich_media):
     assert len(w.snapshot()) == n
 
 
-@pytest.mark.xfail(strict=False, reason="P1-1 workflow_report: a property edit within 0.8 s of ANY other undo step "
-                                        "is merged into that step (apply_props time-based coalescing)")
 def test_property_edit_right_after_another_action_is_its_own_undo_step(ed, modals, rich_media):
     w = ed
     import_all(w, modals, [rich_media["vert"], rich_media["horiz"]])
@@ -288,7 +286,6 @@ def test_property_edit_right_after_another_action_is_its_own_undo_step(ed, modal
     assert json.loads(w.snapshot()) == json.loads(after_trans), "undo must only take back the fade"
 
 
-@pytest.mark.xfail(strict=False, reason="P2 workflow_report: undo/redo always clears the selection")
 def test_undo_keeps_the_selection(ed, modals, rich_media):
     w = ed
     import_all(w, modals, [rich_media["vert"]])
@@ -300,7 +297,6 @@ def test_undo_keeps_the_selection(ed, modals, rich_media):
     assert w.sel is not None and w.sel.id == c.id
 
 
-@pytest.mark.xfail(strict=False, reason="P2 workflow_report: canvas size is not part of undo / dirty state")
 def test_canvas_change_is_undoable_and_marks_project_dirty(ed, modals, rich_media):
     w = ed
     import_all(w, modals, [rich_media["vert"]])
@@ -317,8 +313,6 @@ def test_canvas_change_is_undoable_and_marks_project_dirty(ed, modals, rich_medi
 
 
 # =============================================================================== keyboard focus
-@pytest.mark.xfail(strict=False, reason="P2 workflow_report: Delete pressed in the Library deletes the selected "
-                                        "TIMELINE clip (ApplicationShortcut, typing() only guards text inputs)")
 def test_delete_in_library_does_not_delete_timeline_clip(ed, modals, rich_media):
     w = ed
     import_all(w, modals, [rich_media["vert"]])
@@ -330,19 +324,28 @@ def test_delete_in_library_does_not_delete_timeline_clip(ed, modals, rich_media)
     assert len(w.clips) == 1
 
 
-@pytest.mark.xfail(strict=False, reason="P2 workflow_report: arrow keys on a focused slider move the playhead, "
-                                        "not the slider")
-def test_arrow_keys_on_a_slider_move_the_slider(ed):
+def test_arrow_keys_on_a_slider_move_the_slider(ed, modals, rich_media):
     w = ed
-    sl = next(s for s in w.findChildren(QSlider) if s.isVisibleTo(w) and s.isEnabled())
-    sl.setFocus()
-    v0, t0 = sl.value(), w.t
-    QTest.keyClick(sl, Qt.Key_Right)
+    import_all(w, modals, [rich_media["vert"]])
+    w.add_clip(w.lib[0], None, None)
+    click(w.tl, clip_center(w, w.clips[0]))      # the inspector only has controls when a clip is selected
+    w.set_time(1.0)
+    w.goto_tab("Audio")
     flush()
-    assert sl.value() != v0 and w.t == t0
+    goto_left_tab(w, "Subtitles")
+    sliders = [w.p_vol.findChild(QSlider), w.sub_xpos if isinstance(w.sub_xpos, QSlider) else
+               w.sub_xpos.findChild(QSlider)]
+    for sl in sliders:
+        assert sl is not None and sl.isEnabled()
+        sl.setFocus()
+        flush()
+        v0, t0 = sl.value(), w.t
+        QTest.keyClick(sl, Qt.Key_Left)
+        flush()
+        assert sl.value() != v0, f"{sl.objectName() or sl} did not move"
+        assert w.t == t0, "the playhead moved"
 
 
-@pytest.mark.xfail(strict=False, reason="P3 workflow_report: Space on a focused combo box toggles playback")
 def test_space_on_combo_box_does_not_play(ed, modals, rich_media):
     w = ed
     import_all(w, modals, [rich_media["vert"]])
@@ -496,16 +499,14 @@ def test_missing_media_is_reported_on_open_and_blocks_export(ed, modals, rich_me
     os.rename(mv, mv + ".away")
     w._saved = w.snapshot()
     w.open_project(proj)
-    warn = [c for c in modals.calls if c[0] == "warning"]
-    assert warn and "will_move.mp4" in warn[-1][1][1]
+    warn = [c for c in modals.calls if c[0] in ("warning", "msgbox") and "will_move.mp4" in str(c[1])]
+    assert warn, modals.calls
     assert len(w.clips) == 1 and w.clips[0].path == mv       # the clip is kept (blank), not dropped
     n = len(modals.calls)
     w.export()
     assert modals.calls[n][0] == "warning" and "will_move.mp4" in modals.calls[n][1][1]
 
 
-@pytest.mark.xfail(strict=False, reason="P1-2 workflow_report: opening a project while a library file is offline "
-                                        "drops it from the library; the next save deletes it from the project")
 def test_offline_library_entry_survives_open_and_save(ed, modals, rich_media, tmp_path):
     w = ed
     mv, proj = _save_with_media(w, modals, rich_media, tmp_path)
@@ -529,7 +530,7 @@ CORRUPT = {
     "size_is_text": json.dumps({"clips": [], "W": "wide", "H": 1920}),
     "clip_with_bad_types": json.dumps({"clips": [{"start": "abc", "dur": None, "track": 9}], "W": 1080, "H": 1920}),
 }
-HALF_LOADS = {"clip_with_bad_types"}    # no_size / size_is_text / lib entry: fixed in round 2
+HALF_LOADS = set()    # every case fixed in round 2 (validate() + transactional open)
 
 
 @pytest.mark.parametrize("case", list(CORRUPT))
@@ -578,8 +579,6 @@ def test_import_does_not_freeze_for_seconds(ed, rich_media):
     assert dt < 3.0, f"importing one clip blocked the GUI thread for {dt:.2f} s"
 
 
-@pytest.mark.xfail(strict=False, reason="P2 workflow_report: probe + library icon run ffmpeg synchronously on the "
-                                        "GUI thread (~250 ms per 1080p clip, seconds for a multi-file import / open)")
 def test_import_blocks_gui_less_than_100ms(ed, rich_media):
     t0 = time.perf_counter()
     ed.add_to_library(rich_media["horiz"])

@@ -1101,8 +1101,10 @@ def test_caption_workflow(win, media, modals):
     # emoji buttons insert into the caption box
     emo = [b for b in win.findChildren(QAbstractButton) if b.text() == "\U0001F480"]
     assert len(emo) >= 2
-    win.add_caption("second")
-    assert len(win.clips) == 2 and win.clips[1].start >= win.clips[0].end - 1e-6
+    win.add_caption("second")                   # Overlay 1 busy at the playhead: round 2 uses Overlay 2 (P2-6)
+    a, b = win.clips[0], win.clips[1]
+    assert len(win.clips) == 2
+    assert (b.track == 0 and abs(b.start - a.start) < 1e-6) or b.start >= a.end - 1e-6
     win.add_caption("")
     assert win.sel.text == "Your caption here"
     find_button(win, "load_font").click()       # dialog cancelled -> nothing happens
@@ -1384,7 +1386,8 @@ def test_open_project_errors(win, media, modals, tmp_path):
         dict(__import__("clip_studio").Clip(path=str(tmp_path / "gone.mp4"), name="gone", kind="video").to_dict())])
     missing.write_text(json.dumps(proj))
     win.open_project(str(missing))
-    assert len(win.clips) == 1 and modals.kinds()[-1] == "warning" and "gone.mp4" in str(modals.calls[-1])
+    # round 1: a warning; round 2: a message box with a "Locate files…" button (recorded as msgbox)
+    assert len(win.clips) == 1 and modals.kinds()[-1] in ("warning", "msgbox") and "gone.mp4" in str(modals.calls[-1])
     win.export()
     assert modals.kinds()[-1] == "warning", "export refuses while media is missing"
 
