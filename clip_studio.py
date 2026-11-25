@@ -2044,7 +2044,7 @@ class Timeline(QWidget):
         lib = self.win.lib_entry(ev.mimeData())
         if lib:
             row, t = self.drop_target(lib, ev.position())
-            self.drop_hint = (row, t, lib["dur"] if lib["kind"] != "image" else 5.0)
+            self.drop_hint = (row, t, (lib["dur"] or 3.0) if lib["kind"] != "image" else 5.0)
             self.update()
         ev.setDropAction(Qt.CopyAction)
         ev.accept()
@@ -2093,7 +2093,7 @@ class Timeline(QWidget):
         lp = self.mapFromGlobal(gpos)
         if self.rect().contains(lp):
             row, t = self.drop_target(lib, QPointF(lp))
-            self.drop_hint = (row, t, lib["dur"] if lib["kind"] != "image" else 5.0)
+            self.drop_hint = (row, t, (lib["dur"] or 3.0) if lib["kind"] != "image" else 5.0)
         else:
             self.drop_hint = None
         self.update()
@@ -2158,7 +2158,8 @@ class LibraryList(QListWidget):
         w = self.window()
         try:
             e = w.lib[self.row(it)]
-            return None if e.get("pending") or e.get("missing") else e
+            busy = e.get("pending") and not e.get("importing")      # still importing: may be dropped (queued)
+            return None if busy or e.get("missing") else e
         except Exception:
             return None
 
@@ -4238,7 +4239,7 @@ class MainWindow(QMainWindow):
     def lib_entry(self, mime):
         try:
             e = self.lib[int(bytes(mime.data(MIME)).decode())]
-            return None if e.get("pending") or e.get("missing") else e
+            return None if (e.get("pending") and not e.get("importing")) or e.get("missing") else e
         except Exception:
             return None
 
@@ -4318,12 +4319,16 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem("Importing\u2026\n" + info["name"])
             it.setIcon(self.placeholder_icon(info))
             it.setToolTip(path)
-            it.setFlags(it.flags() & ~Qt.ItemIsEnabled)
+            it.setForeground(QColor("#767880"))      # greyed, but can already be added (it is queued)
             self.libview.addItem(it)
 
             def work():
                 try:
                     res, err = probe(path), None
+                    if not os.path.isfile(path):
+                        res, err = None, "The file can't be found."
+                    elif res["kind"] != "image" and res["dur"] <= 0:
+                        res, err = None, "It doesn't look like a video, audio or picture file."
                 except Exception as e:
                     res, err = None, e
                 self._post(lambda: self._import_read(info, res, err, ask))
@@ -4349,9 +4354,10 @@ class MainWindow(QMainWindow):
         if info not in self.lib:                       # removed, or the project was closed meanwhile
             return
         it = self.libview.item(self.lib.index(info))
+        queued = info.pop("queued", [])
         if err is not None or res is None:
-            store.log_error(f"Could not read {info['path']}", err)
-            self.remove_lib(info)
+            store.log_error(f"Could not read {info['path']}: {err}")
+            self.remove_lib(info)                       # any queued "add to timeline" is dropped with it
             QMessageBox.warning(self, "Could not import", f"\u201c{info['name']}\u201d could not be read:\n{err}")
             return
         info.update(res)
@@ -4360,8 +4366,11 @@ class MainWindow(QMainWindow):
         if it is not None:
             it.setText(info["name"])
             it.setIcon(self.placeholder_icon(info))
-            it.setFlags(it.flags() | Qt.ItemIsEnabled)
+            it.setData(Qt.ForegroundRole, None)
         self._finish_import(info, ask)
+        for track, start in queued:                     # adds asked for while it was being read
+            if not info.get("pending"):                 # (not if it went off to an HDR conversion)
+                self.add_clip(info, track, start)
 
     def importing(self):
         """True while a background import is still reading a file."""
@@ -4646,10 +4655,7 @@ class MainWindow(QMainWindow):
 
     def add_lib_row(self, r):
         if 0 <= r < len(self.lib):
-            if self.lib[r].get("importing"):
-                self.status("Still reading that file - it'll be ready in a moment.")
-                return
-            if self.lib[r].get("pending"):
+            if self.lib[r].get("pending") and not self.lib[r].get("importing"):
                 self.status("That clip is still converting to SDR - it'll be available when the bar finishes.")
                 return
             if self.lib[r].get("missing"):
@@ -4661,6 +4667,10 @@ class MainWindow(QMainWindow):
         self.add_lib_row(self.libview.currentRow())
 
     def add_clip(self, lib, track, start):
+        if lib.get("importing"):                    # still being read: add it as soon as it is ready
+            lib.setdefault("queued", []).append((track, start if start is not None else None))
+            self.status("Adding when ready\u2026")
+            return
         self.push_undo()
         want = "a" if lib["kind"] == "audio" else "v"
         if track is None or TRACKS[track][1] != want:
