@@ -32,8 +32,10 @@ def ed(win, modals):
 
 
 def import_all(w, modals, paths):
+    from conftest import wait_imports
     modals.open_paths = list(paths)
     click(button(w, "Import media"))
+    wait_imports(w)
     return [l["path"] for l in w.lib]
 
 

@@ -26,7 +26,7 @@ from PySide6.QtGui import (QAction, QContextMenuEvent, QDropEvent, QKeyEvent, QK
                            QWheelEvent, QDragMoveEvent)
 from PySide6.QtWidgets import QAbstractButton, QApplication, QGraphicsSceneMouseEvent, QWidget
 
-from conftest import MODULE_FILE, dispose_window
+from conftest import wait_imports, MODULE_FILE, dispose_window
 
 SCRATCH_ORIGINAL = ("/tmp/claude-0/-home-user-Test/6869cefe-e397-54ef-8db1-e6317537ce5b/scratchpad/"
                     "clip_studio_original.py")
@@ -513,12 +513,14 @@ def test_library_import_paths(win, media, modals, flush):
     win.libview.clear()
     modals.open_paths = [media["video"], media["png"]]
     find_button(win, "import").click()
+    wait_imports(win)
     assert [l["name"] for l in win.lib] == ["clip_a.mp4", "pic.png"]
     # drop files onto the window
     md = QMimeData()
     md.setUrls([QUrl.fromLocalFile(media["wav"])])
     ev = QDropEvent(QPointF(10, 10), Qt.CopyAction, md, Qt.LeftButton, Qt.NoModifier)
     win.dropEvent(ev)
+    wait_imports(win)
     assert any(l["path"] == media["wav"] for l in win.lib)
     # double-click / "Add to timeline"
     win.libview.itemDoubleClicked.emit(win.libview.item(0))

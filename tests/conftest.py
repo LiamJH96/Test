@@ -290,15 +290,22 @@ def dispose_window(w):
         w.close()
     except RuntimeError:
         return
-    for sig, slot in ((CS.BUS.wave, w.tl._invalidate), (CS.BUS.prog, w.on_prog), (CS.BUS.done, w.on_export_done),
-                      (CS.BUS.conv, w.on_conv_prog), (CS.BUS.convdone, w.on_conv_done)):
-        try:
-            sig.disconnect(slot)
-        except (RuntimeError, TypeError):
-            pass
+    # (the window disconnects its own BUS slots when it closes; disconnecting again only produced warnings)
     w.deleteLater()
     app.sendPostedEvents(None, QEvent.DeferredDelete)
     _flush(app)
+
+
+def wait_imports(w, timeout=60.0):
+    """Round 2: Import button / file drops read files on a worker thread. Wait until they are in the library."""
+    import time
+    from PySide6.QtWidgets import QApplication
+    if not hasattr(w, "importing"):
+        return
+    t0 = time.time()
+    while w.importing():
+        assert time.time() - t0 < timeout, "background import never finished"
+        _flush(QApplication.instance(), 10)
 
 
 def stop_autosave(w):
