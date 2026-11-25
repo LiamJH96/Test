@@ -3088,7 +3088,8 @@ class MainWindow(QMainWindow):
         self.sync_scroll()
         self.setAcceptDrops(True)
         BUS.prog.connect(self.on_prog)
-        BUS.call.connect(lambda f: f())
+        self._bus_call = lambda f: f()
+        BUS.call.connect(self._bus_call)
         BUS.conv.connect(self.on_conv_prog)
         BUS.convdone.connect(self.on_conv_done)
         BUS.done.connect(self.on_export_done)
@@ -3333,7 +3334,7 @@ class MainWindow(QMainWindow):
         for u in ev.mimeData().urls():
             f = u.toLocalFile()
             if f and os.path.isfile(f):
-                self.add_to_library(f)
+                self.add_to_library(f, background=True)
                 n += 1
         if n:
             self.status(f"Imported {n} file(s).")
@@ -4246,7 +4247,7 @@ class MainWindow(QMainWindow):
                                                 "Media (*.mp4 *.mov *.mkv *.webm *.avi *.png *.jpg *.jpeg *.bmp *.webp "
                                                 "*.gif *.mp3 *.wav *.m4a *.aac *.flac *.ogg);;All files (*)")
         for f in files:
-            self.add_to_library(f)
+            self.add_to_library(f, background=True)
 
     @staticmethod
     def icon_image(info):
@@ -4303,9 +4304,30 @@ class MainWindow(QMainWindow):
         if info["kind"] == "video":
             threading.Thread(target=compute_thumbs, args=(path, info["dur"]), daemon=True).start()
 
-    def add_to_library(self, path, ask=True, known=None):
-        """Import a file. known: the entry stored in a project (its details are trusted, no re-probing)."""
+    def add_to_library(self, path, ask=True, known=None, background=False):
+        """Import a file. known: the entry stored in a project (its details are trusted, no re-probing).
+        background: read the file on a worker thread; the item shows "Importing…" (pending) until it is ready."""
         if any(l["path"] == path for l in self.lib):
+            return
+        if background and not known:
+            ext = os.path.splitext(path)[1].lower()
+            info = dict(kind="image" if ext in IMG_EXT else ("audio" if ext in AUD_EXT else "video"), dur=0.0, w=0,
+                        h=0, hasaudio=False, hdr=False, trc="", path=path, name=os.path.basename(path),
+                        pending=True, importing=True)
+            self.lib.append(info)
+            it = QListWidgetItem("Importing\u2026\n" + info["name"])
+            it.setIcon(self.placeholder_icon(info))
+            it.setToolTip(path)
+            it.setFlags(it.flags() & ~Qt.ItemIsEnabled)
+            self.libview.addItem(it)
+
+            def work():
+                try:
+                    res, err = probe(path), None
+                except Exception as e:
+                    res, err = None, e
+                self._post(lambda: self._import_read(info, res, err, ask))
+            threading.Thread(target=work, daemon=True).start()
             return
         if known and all(k in known for k in ("kind", "dur", "w", "h", "hasaudio")):
             info = dict(known)
@@ -4320,6 +4342,32 @@ class MainWindow(QMainWindow):
         it.setIcon(self.placeholder_icon(info))        # the real picture follows from a worker thread
         it.setToolTip(path)
         self.libview.addItem(it)
+        self._finish_import(info, ask)
+
+    def _import_read(self, info, res, err, ask):
+        """Back on the GUI thread after a background import read the file."""
+        if info not in self.lib:                       # removed, or the project was closed meanwhile
+            return
+        it = self.libview.item(self.lib.index(info))
+        if err is not None or res is None:
+            store.log_error(f"Could not read {info['path']}", err)
+            self.remove_lib(info)
+            QMessageBox.warning(self, "Could not import", f"\u201c{info['name']}\u201d could not be read:\n{err}")
+            return
+        info.update(res)
+        info["pending"] = False
+        info.pop("importing", None)
+        if it is not None:
+            it.setText(info["name"])
+            it.setIcon(self.placeholder_icon(info))
+            it.setFlags(it.flags() | Qt.ItemIsEnabled)
+        self._finish_import(info, ask)
+
+    def importing(self):
+        """True while a background import is still reading a file."""
+        return any(l.get("importing") for l in self.lib)
+
+    def _finish_import(self, info, ask=True):
         self._load_icon(info)
         if info["hdr"] and ask:
             box = QMessageBox(self)
@@ -4351,8 +4399,13 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _set_lib_icon(self, info, img):
+        try:
+            lv = self.libview
+            lv.objectName()                     # raises RuntimeError if the list (window) is already gone
+        except RuntimeError:
+            return
         if info in self.lib:
-            it = self.libview.item(self.lib.index(info))
+            it = lv.item(self.lib.index(info))
             if it is not None:
                 it.setIcon(QIcon(QPixmap.fromImage(img).scaled(120, 68, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
 
@@ -4593,6 +4646,9 @@ class MainWindow(QMainWindow):
 
     def add_lib_row(self, r):
         if 0 <= r < len(self.lib):
+            if self.lib[r].get("importing"):
+                self.status("Still reading that file - it'll be ready in a moment.")
+                return
             if self.lib[r].get("pending"):
                 self.status("That clip is still converting to SDR - it'll be available when the bar finishes.")
                 return
@@ -4985,7 +5041,7 @@ class MainWindow(QMainWindow):
 
     def init_project_state(self):
         self.writer = store.AsyncWriter()
-        self.relay = Relay()
+        self.relay = Relay(self)            # dies with the window, so late worker results can't reach a dead one
         self.relay.call.connect(lambda f: f())
         self.track_session = False   # main() turns this on: the session lock records the open project
         self.unclean_sessions = []
@@ -5787,6 +5843,12 @@ class MainWindow(QMainWindow):
         if not self.proj_path:
             store.discard_recovery(None)       # closed on purpose: never-saved work was saved or let go
         self.writer.stop()
+        for sig, slot in ((BUS.prog, self.on_prog), (BUS.done, self.on_export_done), (BUS.conv, self.on_conv_prog),
+                          (BUS.convdone, self.on_conv_done), (BUS.call, self._bus_call), (BUS.wave, self.tl._invalidate)):
+            try:                                    # a closed window must not react to later exports / jobs
+                sig.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
         shutil.rmtree(self.work, ignore_errors=True)
         ev.accept()
 
