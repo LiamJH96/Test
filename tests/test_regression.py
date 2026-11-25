@@ -1237,6 +1237,8 @@ def test_persisted_paths_unchanged(cs, fake_home):
         cache = os.path.abspath(store.cache_dir())
         assert os.path.abspath(cs.EMO_DIR) == os.path.join(cache, "emoji")
         assert os.path.abspath(cs.CAP_DIR) == os.path.join(cache, "captions")
+        if hasattr(cs, "UI_DIR"):
+            assert os.path.abspath(cs.UI_DIR) == os.path.join(cache, "ui")
         assert not cache.startswith(base), "caches must not stay in the legacy folder"
         if hasattr(cs, "LEGACY_EMO_DIR"):                                      # old emoji downloads still used
             assert cs.LEGACY_EMO_DIR == os.path.join(base, "emoji")
