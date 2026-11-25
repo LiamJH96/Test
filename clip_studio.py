@@ -7,7 +7,7 @@ Projects, autosave and crash recovery live in project_store.py; the project home
 import sys, os, re, json, base64, hashlib, copy, math, shutil, subprocess, threading, time, tempfile, uuid
 
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl, QRectF, QPointF, QPoint, QRect, QSizeF, QMimeData, Signal, QObject
-from PySide6.QtGui import (QFontDatabase, QImage, QFontMetrics, QFontMetricsF, QAction, QColor, QPainter, QPen, QBrush, QPalette, QPixmap, QIcon, QFont,
+from PySide6.QtGui import (QDesktopServices, QFontDatabase, QImage, QFontMetrics, QFontMetricsF, QAction, QColor, QPainter, QPen, QBrush, QPalette, QPixmap, QIcon, QFont,
                            QKeySequence, QShortcut, QDrag, QPolygonF, QPainterPath, QTransform)
 from PySide6.QtWidgets import (QColorDialog, QPlainTextEdit, QFontComboBox, QFrame, QToolTip, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
                                QListWidgetItem, QPushButton, QLabel, QDoubleSpinBox, QSpinBox, QComboBox,
@@ -1339,6 +1339,9 @@ class Timeline(QWidget):
         self.c_lift = QColor(255, 255, 255, 18)
         self.c_drag = QColor(255, 255, 255, 30)
         self.c_accent_fill = QColor(127, 229, 255, 28)
+        self.c_off_body, self.c_off_band = QColor("#3A1D20"), QColor("#4A2226")      # offline media
+        self.pen_off_hatch = QPen(QColor(229, 72, 77, 60), 1)
+        self.pm_off_warn = mk_icon("warn", "#F07A7E", 12).pixmap(24, 24)
 
     def _invalidate(self):
         self._ver += 1
@@ -1434,7 +1437,8 @@ class Timeline(QWidget):
                     for c in w.clips)
         return (self.size().width(), self.size().height(), self.th, self.devicePixelRatioF(), self.t0, self.pps,
                 tuple(id(x) for x in w._sels), id(w.sel), id(self.hov), id(self.hj), self.mode, self.mq, self.plan and (self.plan[0], self.plan[2]),
-                self.drop_hint, sig, len(THUMBS), len(WAVES), self._ver, self._snap_t)
+                self.drop_hint, sig, len(THUMBS), len(WAVES), self._ver, self._snap_t, frozenset(w.offline),
+                tuple(c.path for c in w.clips))
 
     def playhead_update(self):
         x = self.tx(self.win.t)
@@ -1521,9 +1525,10 @@ class Timeline(QWidget):
                 continue
             sel = c in self.win._sels
             body, band, edge, wave, band_t = TRACK_Q[clip_style(c)]
+            offline = c.path in self.win.offline and not c.nat and c.kind != "sub"
             p.setRenderHint(QPainter.Antialiasing, True)
             p.setPen(Qt.NoPen)
-            p.setBrush(body)
+            p.setBrush(self.c_off_body if offline else body)
             p.drawRoundedRect(r, 4, 4)
             p.setRenderHint(QPainter.Antialiasing, False)
             p.save()
@@ -1531,7 +1536,12 @@ class Timeline(QWidget):
             path.addRoundedRect(r, 4, 4)
             p.setClipPath(path, Qt.IntersectClip)
             tiles = None
-            if c.nat:
+            if offline:                   # media can't be found: hatched, no stale thumbnails or waveform
+                p.setPen(self.pen_off_hatch)
+                x0 = int(max(r.left(), LBL - r.height())) - int(r.height())
+                for x in range(x0 - x0 % 8, int(min(r.right(), w)) + 8, 8):
+                    p.drawLine(QPointF(x, r.bottom()), QPointF(x + r.height(), r.top()))
+            elif c.nat:
                 pass                  # captions: plain colour, no thumbnails
             elif c.kind == "image":
                 tiles = (None, [c.path])
@@ -1550,7 +1560,7 @@ class Timeline(QWidget):
                     p.fillRect(r, self.c_dim)
                 else:
                     tiles = None
-            peaks = WAVES.get(c.path) if c.kind == "audio" and np is not None else None
+            peaks = WAVES.get(c.path) if c.kind == "audio" and np is not None and not offline else None
             if peaks is not None:
                 p.setPen(wave)
                 top = r.top() + 16
@@ -1577,12 +1587,17 @@ class Timeline(QWidget):
                     p.drawLine(QPointF(r.right() - c.fout * self.pps, r.top()), r.bottomRight())
                 p.setRenderHint(QPainter.Antialiasing, False)
             # name band
-            p.fillRect(QRectF(r.left(), r.top(), r.width(), 16), band_t if tiles else band)
+            p.fillRect(QRectF(r.left(), r.top(), r.width(), 16), band_t if tiles else (self.c_off_band if offline else band))
             tr = r.adjusted(6, 0, -4, 0).intersected(QRectF(LBL, r.top(), w, 16))
+            name = c.name
+            if offline and tr.width() > 20:
+                p.drawPixmap(QRectF(tr.left(), r.top() + 2, 12, 12), self.pm_off_warn, QRectF(self.pm_off_warn.rect()))
+                tr = tr.adjusted(16, 0, 0, 0)
+                name += " \u00b7 offline"
             if tr.width() > 4:
                 p.setFont(self.f_small)
                 p.setPen(self.c_band_text)
-                p.drawText(tr, Qt.AlignLeft | Qt.AlignVCenter, fm.elidedText(c.name, Qt.ElideRight, int(tr.width())))
+                p.drawText(tr, Qt.AlignLeft | Qt.AlignVCenter, fm.elidedText(name, Qt.ElideRight, int(tr.width())))
             p.restore()
             p.setRenderHint(QPainter.Antialiasing, True)
             p.setBrush(Qt.NoBrush)
@@ -2598,6 +2613,33 @@ class PreviewView(QGraphicsView):
         if not self.zoomed:
             self.fitInView(self.scene().sceneRect(), Qt.KeepAspectRatio)
 
+    def drawForeground(self, p, rect):
+        """Over the picture, in screen pixels: say so when the media under the playhead is offline."""
+        if not self.win.offline_at_playhead():
+            return
+        p.save()
+        p.resetTransform()
+        vr = QRectF(self.viewport().rect())
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        p.setFont(f)
+        lines = ["Media offline", "Right-click the item in the Library and choose Locate file\u2026"]
+        fm = QFontMetrics(f)
+        bw = min(vr.width() - 24, max(fm.horizontalAdvance(t) for t in lines) + 32)
+        box = QRectF(vr.center().x() - bw / 2, vr.center().y() - 44, bw, 88)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(20, 21, 24, 230))
+        p.drawRoundedRect(box, 8, 8)
+        p.drawPixmap(QRectF(box.center().x() - 10, box.top() + 12, 20, 20),
+                     mk_icon("warn", "#F07A7E", 20).pixmap(40, 40), QRectF(0, 0, 40, 40))
+        p.setPen(QColor("#E8E9EC"))
+        p.drawText(QRectF(box.left(), box.top() + 38, bw, 18), Qt.AlignCenter, lines[0])
+        p.setPen(QColor("#A6A8B0"))
+        p.drawText(QRectF(box.left() + 8, box.top() + 58, bw - 16, 18), Qt.AlignCenter,
+                   fm.elidedText(lines[1], Qt.ElideRight, int(bw - 16)))
+        p.restore()
+
     def _label(self):
         b = getattr(self.win, "b_zoomv", None)
         if b is not None:
@@ -2704,7 +2746,6 @@ PROJECT_KEYS = ("substyle", "W", "H", "lib", "clips")      # what project_dict()
 class ElideButton(QPushButton):
     """A push button whose text is elided to fit, so a long project name never widens the window.
     Its minimum is a fixed 80 px; it asks for the full text width up to maximumWidth()."""
-    PAD = 38                      # padding + chevron icon + spacing + border
 
     def __init__(self, text=""):
         super().__init__(text)
@@ -2715,21 +2756,23 @@ class ElideButton(QPushButton):
         self.updateGeometry()
         self._elide()
 
-    def _bold_metrics(self):
-        f = QFont(self.font())
-        f.setWeight(QFont.DemiBold)
-        return QFontMetrics(f)
+    def _chrome(self):
+        """Width the button needs besides its text (padding, chevron, spacing, border), as the style measures it."""
+        return QPushButton.sizeHint(self).width() - math.ceil(self.fontMetrics().horizontalAdvance(self.text()))
 
     def sizeHint(self):
         sh = super().sizeHint()
-        return QSize(min(self.maximumWidth(), self._bold_metrics().horizontalAdvance(self.full) + self.PAD),
-                     sh.height())
+        need = math.ceil(self.fontMetrics().horizontalAdvance(self.full)) + self._chrome() + 4
+        return QSize(min(self.maximumWidth(), need), sh.height())
 
     def minimumSizeHint(self):
         return QSize(80, super().minimumSizeHint().height())
 
     def _elide(self):
-        t = self._bold_metrics().elidedText(self.full, Qt.ElideRight, max(20, self.width() - self.PAD))
+        fm = self.fontMetrics()
+        avail = self.width() - self._chrome()
+        t = self.full if fm.horizontalAdvance(self.full) <= avail + 1 else \
+            fm.elidedText(self.full, Qt.ElideRight, max(20, avail))
         if t != self.text():
             self.setText(t)
 
@@ -2764,6 +2807,17 @@ class MainWindow(QMainWindow):
     def sel(self, v):
         self._sel = v
         self._sels = [v] if v is not None else []
+        self.sync_tools()
+
+    def sync_tools(self):
+        """Toolbar buttons that need a selected clip look disabled without one (kept in step with the selection)."""
+        if getattr(self, "b_split", None) is None:
+            return
+        c = self._sel
+        has = c is not None
+        for b in (self.b_split, self.b_delete, self.b_ripple):
+            b.setEnabled(has)
+        self.b_detach.setEnabled(has and c.kind == "video" and bool(c.hasaudio))
 
     def selected(self):
         """Every selected clip (Ctrl+click, Shift+click or a drag box can select several)."""
@@ -2774,6 +2828,7 @@ class MainWindow(QMainWindow):
         cl = [c for c in cl if c in self.clips]
         self._sels = cl
         self._sel = primary if primary in cl else (cl[-1] if cl else None)
+        self.sync_tools()
         if len(cl) > 1:
             self.status(f"{len(cl)} clips selected: drag to move them together, Del to delete.")
         self.load_props()
@@ -2811,6 +2866,7 @@ class MainWindow(QMainWindow):
         self._saved = "[]"
         self._loading = False
         self.work = tempfile.mkdtemp(prefix="clipstudio_")
+        self.offline = set()
         self.init_project_state()
 
         # library
@@ -3063,7 +3119,9 @@ class MainWindow(QMainWindow):
             b.clicked.connect(fn)
             b.setObjectName(name)
             if icon:
-                b.setIcon(mk_icon(icon, "#0a0a0e" if name == "play" else "#C9CBD1"))
+                ic = mk_icon(icon, "#0a0a0e" if name == "play" else "#C9CBD1")
+                ic.addPixmap(mk_icon(icon, "#4F5158").pixmap(48, 48), QIcon.Disabled)   # dims with the button
+                b.setIcon(ic)
                 b.setIconSize(QSize(16, 16))
             if fixed:
                 b.setFixedSize(*fixed)
@@ -3118,17 +3176,21 @@ class MainWindow(QMainWindow):
         eb.addSpacing(4)
         eb.addWidget(sep())
         eb.addSpacing(4)
-        eb.addWidget(btn("Split", "Cut the selected clip in two at the red playhead  (S)", self.split, icon="split"))
-        eb.addWidget(btn("Delete", "Delete the selected clip  (Del)", self.delete_sel, icon="trash"))
+        self.b_split = btn("Split", "Cut the selected clip in two at the red playhead  (S)", self.split, icon="split")
+        eb.addWidget(self.b_split)
+        self.b_delete = btn("Delete", "Delete the selected clip  (Del)", self.delete_sel, icon="trash")
+        eb.addWidget(self.b_delete)
         eb.addWidget(btn("Add gap", "Insert empty space at the playhead: everything after it moves later",
                          lambda: self.insert_gap(), icon="plus"))   # lambda: clicked() would pass False as the time
-        eb.addWidget(btn("Delete && close gap", "Delete the clip and pull later clips on that track back  "
-                         "(Shift+Del)", self.ripple_delete, icon="ripple"))
+        self.b_ripple = btn("Delete && close gap", "Delete the clip and pull later clips on that track back  "
+                            "(Shift+Del)", self.ripple_delete, icon="ripple")
+        eb.addWidget(self.b_ripple)
         eb.addSpacing(4)
         eb.addWidget(sep())
         eb.addSpacing(4)
-        eb.addWidget(btn("Detach audio", "Split the sound of the selected video into its own audio clip",
-                         self.detach_audio, icon="audio"))
+        self.b_detach = btn("Detach audio", "Split the sound of the selected video into its own audio clip",
+                            self.detach_audio, icon="audio")
+        eb.addWidget(self.b_detach)
         eb.addStretch(1)
         self.ck_snap = QCheckBox("Snap")
         self.ck_snap.setChecked(True)
@@ -3493,7 +3555,7 @@ class MainWindow(QMainWindow):
         v.addWidget(QLabel("Caption text"))
         self.cap_edit = QPlainTextEdit()
         self.cap_edit.setPlaceholderText("Select a caption on the timeline to edit its text")
-        self.cap_edit.setFixedHeight(84)
+        self.cap_edit.setFixedHeight(72)
         self.cap_edit.textChanged.connect(self.apply_caption)
         v.addWidget(self.cap_edit)
         self.cap_emoji = self.emoji_row(self.cap_edit)
@@ -3515,6 +3577,8 @@ class MainWindow(QMainWindow):
         self.cap_tcol = ColorButton("#000000")
         self.cap_bcol.setToolTip("Box colour")
         self.cap_tcol.setToolTip("Text colour")
+        for b in (self.cap_bcol, self.cap_tcol):
+            b.setFixedWidth(96)
         self.cap_bcol.changed.connect(lambda: self.set_cap_colour("cbox", self.cap_bcol.color))
         self.cap_tcol.changed.connect(lambda: self.set_cap_colour("ccol", self.cap_tcol.color))
         b_font = QPushButton("Load font file...")
@@ -3528,8 +3592,12 @@ class MainWindow(QMainWindow):
         f.addRow("Size", self.cap_size)
         f.addRow("Boldness", self.cap_bold)
         f.addRow(self.cap_box)
-        f.addRow("Box", self.cap_bcol)
-        f.addRow("Text", self.cap_tcol)
+        crow = QHBoxLayout()                     # box + text colour on one row keeps the panel short
+        crow.setSpacing(8)
+        crow.addWidget(self.cap_bcol)
+        crow.addWidget(self.cap_tcol)
+        crow.addStretch(1)
+        f.addRow("Colours", crow)
         v.addLayout(f)
         n = QLabel("Each line gets its own box that hugs the text. Press Enter for a new line. Drag the caption in "
                    "the preview to move it.")
@@ -3625,9 +3693,11 @@ class MainWindow(QMainWindow):
         gf.addRow("Language", self.sub_lang)
         gf.addRow("Words per line", self.sub_maxwords)
         row = QHBoxLayout()
+        row.setSpacing(12)
         row.addWidget(self.sub_gpu)
         row.addWidget(self.sub_vad)
-        gf.addRow(row)
+        row.addStretch(1)
+        gf.addRow("", row)                      # in the field column, under the other fields
         gf.addRow(self.sub_selonly)
         gf.addRow(b)
         hint = QLabel("Subtitles every clip with sound on the timeline (not the Music track). They appear on the "
@@ -3679,9 +3749,11 @@ class MainWindow(QMainWindow):
         b_font2.clicked.connect(self.load_font)
         sf.addRow("", b_font2)
         r2 = QHBoxLayout()
+        r2.setSpacing(12)
         r2.addWidget(self.sub_bold)
         r2.addWidget(self.sub_upper)
-        sf.addRow(r2)
+        r2.addStretch(1)
+        sf.addRow("", r2)
         sf.addRow("Size", self.sub_size)
         sf.addRow("Text colour", self.sub_cmain)
         sf.addRow("Not yet spoken", self.sub_cunsp)
@@ -4029,6 +4101,7 @@ class MainWindow(QMainWindow):
 
     def load_props(self):
         c = self.sel
+        self.sync_tools()
         self._loading = True
         try:
             self.p_name.setText(c.name if c else "Click a clip on the timeline to edit it")
@@ -4309,6 +4382,15 @@ class MainWindow(QMainWindow):
             return
         self.remove_lib(info)
         self.status(f"Removed {info['name']} from the library.")
+
+    def refresh_offline(self):
+        """Which media paths can't be found (cached here, so painting never touches the disk)."""
+        paths = {c.path for c in self.clips if not c.nat and c.kind != "sub" and c.path}
+        self.offline = {p for p in paths if not os.path.exists(p)}
+
+    def offline_at_playhead(self):
+        return any(c.path in self.offline and c.start <= self.t < c.end for c in self.clips
+                   if not c.nat and c.kind in ("video", "image"))
 
     def missing_paths(self):
         paths = {l["path"] for l in self.lib if l.get("missing")}
@@ -4629,6 +4711,7 @@ class MainWindow(QMainWindow):
         keep = [c for c in self.clips if c.id in ids]
         self._sels = keep
         self._sel = next((c for c in keep if c.id == prim), keep[-1] if keep else None)
+        self.sync_tools()
         self.load_props()
         self.after_edit()
 
@@ -4667,7 +4750,9 @@ class MainWindow(QMainWindow):
         return project_len(self.clips)
 
     def after_edit(self, light=False):
+        self.sync_tools()
         if not light:
+            self.refresh_offline()
             self.update_title()
             self.note_change()
         self.sync_scroll()
@@ -4861,6 +4946,9 @@ class MainWindow(QMainWindow):
 
     def update_preview(self, force=False):
         self.empty_txt.setVisible(not self.clips)
+        if self.offline or getattr(self, "_off_shown", False):      # the "Media offline" note follows the playhead
+            self._off_shown = bool(self.offline)
+            self.view.viewport().update()
         if getattr(self, "subitem", None) is not None:
             self.subitem.set_time(self.t)
         vis = None
@@ -5254,7 +5342,7 @@ class MainWindow(QMainWindow):
         b.setText(text)
         b.setToolTip(tip)
         if icon:
-            b.setIcon(mk_icon(icon, col))
+            b.setIcon(QIcon(mk_icon(icon, col).pixmap(24, 24)))   # every state: one 24 px pixmap, same text x
         elif st == "saving":
             self._spin_step()
         else:                                    # same text position in every state: a blank 12 px icon
@@ -5282,7 +5370,7 @@ class MainWindow(QMainWindow):
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(QPen(QColor("#A6A8B0"), 2.4, Qt.SolidLine, Qt.RoundCap))
-        p.drawArc(QRectF(4, 4, 16, 16), -self._spin_a * 16, 270 * 16)
+        p.drawArc(QRectF(4.5, 4.5, 15, 15), -self._spin_a * 16, 270 * 16)
         p.end()
         self.lbl_save.setIcon(QIcon(pm))
 
@@ -5940,8 +6028,8 @@ class MainWindow(QMainWindow):
         self.exp_T = T
         self.prog = QProgressDialog("Exporting...", "Cancel", 0, 1000, self)
         self.prog.setWindowTitle("Export")
-        self.prog.setLabelText("Exporting video\u2026")
-        self.prog.setMinimumWidth(400)
+        self.prog.setLabelText(f"Exporting {os.path.basename(out)}\u2026")
+        self.prog.setMinimumWidth(420)
         self.prog.setWindowModality(Qt.WindowModal)
         self.prog.canceled.connect(lambda: setattr(self, "cancel_flag", True))
         self.prog.show()
@@ -5972,6 +6060,13 @@ class MainWindow(QMainWindow):
     def on_prog(self, f):
         if self.prog:
             self.prog.setValue(int(f * 1000))
+            el = time.time() - getattr(self, "export_t0", time.time())
+            left = ""
+            if 0.02 < f < 1 and el > 1.5:
+                r = int(el / f - el)
+                left = f"  \u00b7  about {r // 60}:{r % 60:02d} left"
+            self.prog.setLabelText(f"Exporting {os.path.basename(getattr(self, 'export_out', ''))}\n"
+                                   f"{int(f * 100)}%{left}")
 
     def on_export_done(self, err):
         if self.prog:
@@ -5980,19 +6075,31 @@ class MainWindow(QMainWindow):
         if err == "cancelled":
             return
         if err:
-            QMessageBox.warning(self, "Export failed", err)
+            m = QMessageBox(self)
+            m.setIcon(QMessageBox.Critical)
+            m.setWindowTitle("Export failed")
+            m.setText("The export didn't finish.")
+            m.setInformativeText("ffmpeg reported an error. The details are below; you can copy them.")
+            m.setDetailedText(err)
+            m.setDefaultButton(m.addButton("Close", QMessageBox.RejectRole))
+            m.exec()
         else:
             secs = int(time.time() - getattr(self, "export_t0", time.time()))
             how = "NVENC (graphics card)" if self.ck_nv.isChecked() else "CPU"
+            out = getattr(self, "export_out", "")
             m = QMessageBox(self)
             m.setIcon(QMessageBox.Information)
             m.setWindowTitle("Export finished")
-            m.setText(f"Done in {secs // 60}m {secs % 60:02d}s using {how}.")
-            m.setInformativeText(getattr(self, "export_out", ""))
+            m.setText("Your video is ready.")
+            m.setInformativeText(f"{os.path.basename(out)}  \u00b7  done in {secs // 60}m {secs % 60:02d}s using {how}")
+            m.setToolTip(out)
             op = m.addButton("Show in folder", QMessageBox.AcceptRole)
+            play = m.addButton("Play", QMessageBox.ActionRole)
             m.addButton("Close", QMessageBox.RejectRole)
             m.setDefaultButton(op)
             m.exec()
+            if m.clickedButton() is play and out:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(out))
             if m.clickedButton() is op:
                 out = getattr(self, "export_out", "")
                 try:
@@ -6283,8 +6390,49 @@ QProgressBar#slim::chunk { border-radius: 3px; }
 """
 
 
+def themed_icon(kind, size=32):
+    """Quiet, stroke-only message-box glyphs in the theme colours (instead of Fusion's bright stock icons)."""
+    col = QColor({"info": "#7FE5FF", "question": "#A6A8B0", "warning": "#E2A33B", "error": "#E5484D"}[kind])
+    pm = QPixmap(size * 2, size * 2)
+    pm.setDevicePixelRatio(2)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(col, 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    p.setBrush(Qt.NoBrush)
+    s = size
+    if kind == "warning":
+        p.drawPolygon(QPolygonF([QPointF(s / 2, 3), QPointF(s - 2.5, s - 4), QPointF(2.5, s - 4)]))
+        p.drawLine(QPointF(s / 2, s * 0.38), QPointF(s / 2, s * 0.6))
+        p.drawPoint(QPointF(s / 2, s * 0.72))
+    else:
+        p.drawEllipse(QRectF(2, 2, s - 4, s - 4))
+        f = QFont()
+        f.setPixelSize(int(s * 0.55))
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.drawText(QRectF(0, 0, s, s), Qt.AlignCenter, {"info": "i", "question": "?", "error": "!"}[kind])
+    p.end()
+    return QIcon(pm)
+
+
+class ThemedStyle(QProxyStyle):
+    """Fusion, with message-box icons that match the dark theme."""
+    ICONS = {QStyle.SP_MessageBoxInformation: "info", QStyle.SP_MessageBoxQuestion: "question",
+             QStyle.SP_MessageBoxWarning: "warning", QStyle.SP_MessageBoxCritical: "error"}
+
+    def standardIcon(self, sp, opt=None, widget=None):
+        kind = self.ICONS.get(sp)
+        if kind:
+            return themed_icon(kind)
+        return super().standardIcon(sp, opt, widget)
+
+
 def dark_theme(app):
-    app.setStyle("Fusion")
+    global _STYLE
+    from PySide6.QtWidgets import QStyleFactory
+    _STYLE = ThemedStyle(QStyleFactory.create("Fusion"))      # kept referenced for the app's lifetime
+    app.setStyle(_STYLE)
     f = QFont()
     f.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Inter", "SF Pro Text", "Helvetica Neue", "Noto Sans",
                    "DejaVu Sans"])
