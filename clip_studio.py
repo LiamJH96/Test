@@ -6,13 +6,14 @@ Needs: pip install PySide6 numpy imageio-ffmpeg   (ffmpeg on PATH or imageio-ffm
 import sys, os, re, json, base64, hashlib, copy, math, shutil, subprocess, threading, time, tempfile, uuid
 
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl, QRectF, QPointF, QPoint, QRect, QSizeF, QMimeData, Signal, QObject
-from PySide6.QtGui import (QFontDatabase, QImage, QFontMetricsF, QAction, QColor, QPainter, QPen, QBrush, QPalette, QPixmap, QIcon, QFont,
+from PySide6.QtGui import (QFontDatabase, QImage, QFontMetrics, QFontMetricsF, QAction, QColor, QPainter, QPen, QBrush, QPalette, QPixmap, QIcon, QFont,
                            QKeySequence, QShortcut, QDrag, QPolygonF, QPainterPath, QTransform)
 from PySide6.QtWidgets import (QColorDialog, QPlainTextEdit, QFontComboBox, QFrame, QToolTip, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
                                QListWidgetItem, QPushButton, QLabel, QDoubleSpinBox, QSpinBox, QComboBox,
                                QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsItem, QGraphicsPixmapItem, QGraphicsPathItem, QGraphicsSimpleTextItem, QSlider, QTabWidget, QProgressBar,
                                QSplitter, QScrollArea, QFileDialog, QMessageBox, QScrollBar, QMenu, QGroupBox,
-                               QFormLayout, QCheckBox, QProgressDialog, QAbstractSpinBox, QLineEdit, QInputDialog)
+                               QFormLayout, QCheckBox, QProgressDialog, QAbstractSpinBox, QLineEdit, QInputDialog,
+                               QGridLayout, QStyledItemDelegate, QProxyStyle, QStyle)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 
@@ -1124,8 +1125,59 @@ def build_export(clips, W, H, fps, out, nvenc, subs=None):
 
 # ----------------------------------------------------------------------------- timeline widget
 
-LBL, RULER, TH = 90, 28, 58
+LBL, RULER, TH = 96, 28, 46
 COL = {"sub": QColor(150, 70, 150), "video": QColor(54, 112, 190), "image": QColor(140, 84, 190), "audio": QColor(44, 150, 96)}
+
+# timeline colours (made once: the timeline repaints a lot)
+TL = dict(bg="#141518", lane="#17181B", lane_main="#1A1B1F", lane_line="#222328", head="#1B1C1F",
+          head_edge="#26272C", head_text="#A6A8B0", head_text_main="#E8E9EC", ruler="#1B1C1F",
+          tick="#34353B", tick_minor="#2A2B30", ruler_text="#8A8C95", playhead="#F2555A",
+          accent="#4886EC", select="#F2F3F5", empty="#767880", empty_title="#A6A8B0")
+TLC = {k: QColor(v) for k, v in TL.items()}
+TRACK_STYLE = {   # body, band (name strip), edge (1px border), wave
+    "video":   ("#34557A", "#2A4563", "#4E77A6", "#9FBBE0"),
+    "overlay": ("#54497F", "#433A67", "#7466AB", "#B7ADE0"),
+    "caption": ("#7A5A2C", "#634823", "#A57B3E", "#E3C08A"),
+    "audio":   ("#2F5E48", "#254C3A", "#468A69", "#8FD1AE"),
+    "music":   ("#2A5660", "#21454E", "#3F7E8C", "#86C6D2"),
+    "sub":     ("#63395A", "#502E49", "#8E5582", "#D6A2C8"),
+}
+TRACK_CHIP = ["overlay", "overlay", "video", "audio", "music", "sub"]   # header colour chip, by TRACKS index
+
+
+def _track_colours():
+    out = {}
+    for k, (body, band, edge, wave) in TRACK_STYLE.items():
+        bt, wv = QColor(band), QColor(wave)
+        bt.setAlpha(235)
+        wv.setAlpha(190)
+        out[k] = (QColor(body), QColor(band), QColor(edge), wv, bt)
+    return out
+
+
+TRACK_Q = _track_colours()
+
+
+def clip_style(c):
+    if c.nat:
+        return "caption"
+    if c.kind == "sub":
+        return "sub"
+    if c.kind == "audio":
+        return "music" if c.track == 4 else "audio"
+    if c.kind == "image" or c.track in (0, 1):
+        return "overlay"
+    return "video"
+
+
+def fmt_ruler(t, step):
+    """Ruler label: 0:05, 1:05.5, 0:00.25, 1:00:00 (only as precise as the tick spacing needs)."""
+    d = 0 if step >= 1 else (2 if step == 0.25 else 1)
+    t = max(0.0, round(t, d))
+    h, rem = divmod(t, 3600)
+    m, s = divmod(rem, 60)
+    sec = f"{s:0{3 + d}.{d}f}" if d else f"{int(s):02d}"
+    return f"{int(h)}:{int(m):02d}:{sec}" if h else f"{int(m)}:{sec}"
 
 
 def fmt_t(t):
@@ -1163,9 +1215,30 @@ class Timeline(QWidget):
         self._auto.timeout.connect(self._auto_tick)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
-        self.setMinimumHeight(RULER + TH * len(TRACKS) + 6)
+        self.setMinimumHeight(RULER + TH * len(TRACKS) + 4)
         self.setFocusPolicy(Qt.StrongFocus)
         BUS.wave.connect(self._invalidate)
+        # fonts and pens made once, not on every repaint
+        self.f_small = QFont(self.font())
+        self.f_small.setPixelSize(11)
+        self.fm_small = QFontMetrics(self.f_small)
+        self.f_head = QFont(self.font())
+        self.f_head.setPixelSize(12)
+        self.f_head.setWeight(QFont.Medium)
+        self.f_empty = QFont(self.font())
+        self.f_empty.setPixelSize(13)
+        self.f_empty.setWeight(QFont.Medium)
+        self.f_empty2 = QFont(self.font())
+        self.f_empty2.setPixelSize(12)
+        self.pen_sel = QPen(TLC["select"], 2)
+        self.pen_hov = QPen(QColor(255, 255, 255, 140), 1)
+        self.pen_fade = QPen(QColor(255, 255, 255, 110), 1)
+        self.c_band_text = QColor("#F2F3F5")
+        self.c_fade = QColor(0, 0, 0, 110)
+        self.c_dim = QColor(0, 0, 0, 50)
+        self.c_lift = QColor(255, 255, 255, 18)
+        self.c_drag = QColor(255, 255, 255, 30)
+        self.c_accent_fill = QColor(72, 134, 236, 36)
 
     def _invalidate(self):
         self._ver += 1
@@ -1272,59 +1345,83 @@ class Timeline(QWidget):
         p.drawPixmap(0, 0, self._cache)
         x = self.tx(self.win.t)
         if x >= LBL:
-            p.setPen(QPen(QColor(255, 70, 70), 2))
-            p.drawLine(int(x), 0, int(x), self.height())
-            p.setBrush(QColor(255, 70, 70))
+            col = TLC["playhead"]
+            xi = int(x)
+            p.fillRect(QRectF(xi, RULER - 2, 1, self.height()), col)      # 1px crisp line from the ruler down
+            p.setRenderHint(QPainter.Antialiasing, True)
             p.setPen(Qt.NoPen)
-            p.drawPolygon(QPolygonF([QPointF(x - 6, 0), QPointF(x + 6, 0), QPointF(x, 11)]))
+            p.setBrush(col)
+            p.drawPolygon(QPolygonF([QPointF(xi - 5.5, 2), QPointF(xi + 6.5, 2), QPointF(xi + 6.5, RULER - 12),
+                                     QPointF(xi + 0.5, RULER - 4), QPointF(xi - 5.5, RULER - 12)]))   # head in the ruler
         self._phx = x
 
     def paint_static(self, p):
         p.setRenderHint(QPainter.Antialiasing, False)
-        p.fillRect(self.rect(), QColor(24, 24, 28))
+        p.fillRect(self.rect(), TLC["bg"])
         w = self.width()
-        # tracks
+        nt = len(TRACKS)
+        # tracks: plain lanes (no zebra stripes) and a header column with a colour chip per track type
+        p.setFont(self.f_head)
         for i, (nm, kind) in enumerate(TRACKS):
             y = RULER + i * TH
-            p.fillRect(LBL, y, w - LBL, TH, QColor(34, 34, 40) if i % 2 == 0 else QColor(29, 29, 34))
-            p.fillRect(0, y, LBL, TH, QColor(40, 40, 48))
-            p.setPen(QColor(190, 190, 200))
-            p.drawText(8, y, LBL - 10, TH, Qt.AlignVCenter | Qt.AlignLeft, nm)
-            p.setPen(QColor(18, 18, 22))
-            p.drawLine(0, y + TH - 1, w, y + TH - 1)
-        # ruler
-        p.fillRect(0, 0, w, RULER, QColor(40, 40, 48))
+            p.fillRect(LBL, y, w - LBL, TH, TLC["lane_main"] if nm == "Video" else TLC["lane"])
+            p.setPen(TLC["lane_line"])
+            p.drawLine(LBL, y + TH - 1, w, y + TH - 1)
+            p.fillRect(0, y, LBL, TH, TLC["head"])
+            p.setPen(TLC["head_edge"])
+            p.drawLine(0, y + TH - 1, LBL, y + TH - 1)
+            p.fillRect(QRectF(0, y + 6, 3, TH - 12), TRACK_Q[TRACK_CHIP[i]][2])
+            p.setPen(TLC["head_text_main"] if nm == "Video" else TLC["head_text"])
+            p.drawText(14, y, LBL - 18, TH, Qt.AlignVCenter | Qt.AlignLeft, nm)
+        p.setPen(TLC["head_edge"])
+        p.drawLine(LBL - 1, RULER, LBL - 1, RULER + TH * nt)
+        # ruler: major ticks with short labels, minor ticks in between
+        p.fillRect(0, 0, w, RULER, TLC["ruler"])
+        p.setPen(TLC["head_edge"])
+        p.drawLine(0, RULER - 1, w, RULER - 1)
         step = next(s for s in [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300] if s * self.pps >= 70)
-        t = math.floor(self.t0 / step) * step
-        p.setPen(QColor(150, 150, 160))
-        while self.tx(t) < w:
-            x = int(self.tx(t))
+        k = math.floor(self.t0 / step)           # integer index: no float drift in the labels
+        minors = 4 if step in (0.25, 2, 120) else 5
+        p.setFont(self.f_small)
+        while True:
+            t = k * step
+            x = self.tx(t)
+            if x >= w:
+                break
+            p.setPen(TLC["tick_minor"])
+            for j in range(1, minors):
+                xm = int(self.tx(t + j * step / minors))
+                if LBL <= xm < w:
+                    p.drawLine(xm, RULER - 5, xm, RULER - 2)
             if x >= LBL:
-                p.drawLine(x, RULER - 8, x, RULER)
-                p.drawText(x + 3, 0, 80, RULER - 6, Qt.AlignVCenter, fmt_t(t))
-            t += step
+                p.setPen(TLC["tick"])
+                p.drawLine(int(x), 4, int(x), RULER - 2)
+                p.setPen(TLC["ruler_text"])
+                p.drawText(QRectF(x + 4, 2, 90, RULER - 10), Qt.AlignLeft | Qt.AlignVCenter, fmt_ruler(t, step))
+            k += 1
         # clips
-        p.setClipRect(LBL, RULER, w - LBL, TH * len(TRACKS))
+        p.setClipRect(LBL, RULER, w - LBL, TH * nt)
         dragging = self.win.sel if self.mode == "move" else None
         order = [c for c in self.win.clips if c is not dragging] + ([dragging] if dragging else [])
+        fm = self.fm_small
         for c in order:
             r = self.clip_rect(c)
             if r.right() < LBL or r.left() > w:
                 continue
             sel = c in self.win._sels
-            col = COL.get(c.kind, QColor(90, 90, 90))
+            body, band, edge, wave, band_t = TRACK_Q[clip_style(c)]
+            p.setRenderHint(QPainter.Antialiasing, True)
             p.setPen(Qt.NoPen)
-            p.setBrush(col.darker(130))
-            p.drawRoundedRect(r, 5, 5)
+            p.setBrush(body)
+            p.drawRoundedRect(r, 4, 4)
+            p.setRenderHint(QPainter.Antialiasing, False)
             p.save()
             path = QPainterPath()
-            path.addRoundedRect(r, 5, 5)
+            path.addRoundedRect(r, 4, 4)
             p.setClipPath(path, Qt.IntersectClip)
             tiles = None
             if c.nat:
-                col = QColor(205, 135, 40)
-                p.setBrush(col.darker(130))
-                p.drawRoundedRect(r, 5, 5)
+                pass                  # captions: plain colour, no thumbnails
             elif c.kind == "image":
                 tiles = (None, [c.path])
             elif c.kind == "video" and c.path in THUMBS:
@@ -1339,60 +1436,80 @@ class Timeline(QWidget):
                         idx = 0 if iv is None else min(len(files) - 1, int((c.inp + (x - r.left()) / self.pps) / iv))
                         p.drawPixmap(QRectF(x, r.top(), tw, r.height()), pix_of(files[idx]), QRectF(pix_of(files[idx]).rect()))
                         x += tw
-                    p.fillRect(r, QColor(0, 0, 0, 40))
+                    p.fillRect(r, self.c_dim)
+                else:
+                    tiles = None
             peaks = WAVES.get(c.path) if c.kind == "audio" and np is not None else None
             if peaks is not None:
-                p.setPen(QColor(255, 255, 255, 120))
-                mid = r.center().y() + 6
+                p.setPen(wave)
+                top = r.top() + 16
+                mid = (top + r.bottom()) / 2
+                scale = (r.bottom() - top) / 2 - 2
                 for x in range(int(max(r.left(), LBL)), int(min(r.right(), w)), 2):
                     j = int((c.inp + (x - r.left()) / self.pps) * 100)
                     if 0 <= j < len(peaks):
-                        amp = float(peaks[j:j + max(1, int(200 / self.pps))].max()) * (r.height() / 2 - 8)
+                        amp = float(peaks[j:j + max(1, int(200 / self.pps))].max()) * scale
                         p.drawLine(x, int(mid - amp), x, int(mid + amp))
-            # fade shading
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(0, 0, 0, 150))
-            if c.fin > 0:
-                p.drawPolygon(QPolygonF([r.topLeft(), QPointF(r.left() + c.fin * self.pps, r.top()), r.bottomLeft()]))
-            if c.fout > 0:
-                p.drawPolygon(QPolygonF([r.topRight(), QPointF(r.right() - c.fout * self.pps, r.top()), r.bottomRight()]))
-            # name band
-            p.fillRect(QRectF(r.left(), r.top(), r.width(), 15), QColor(0, 0, 0, 150))
-            p.setPen(Qt.white)
-            p.drawText(r.adjusted(6, 0, -4, 0).intersected(QRectF(LBL, r.top(), w, 15)), Qt.AlignLeft | Qt.AlignVCenter, c.name)
-            p.restore()
-            if sel:
-                p.setPen(QPen(QColor(127, 229, 255), 2))
-            elif c is self.hov:
-                p.setPen(QPen(QColor(255, 255, 255, 160), 1))
-            else:
-                p.setPen(QPen(col.lighter(140), 1))
-            p.setBrush(Qt.NoBrush)
-            p.drawRoundedRect(r, 5, 5)
-            if c is dragging:
-                p.fillRect(r, QColor(255, 255, 255, 40))
-            ti = trans_info(self.win.clips, c)
-            if ti:
-                bx = r.left()
-                p.setBrush(QColor(255, 200, 60))
-                p.setPen(Qt.black)
-                p.drawRect(QRectF(bx - 9, r.center().y() - 9, 18, 18))
-                p.drawText(QRectF(bx - 9, r.center().y() - 9, 18, 18), Qt.AlignCenter, "T")
-            elif c is self.hj and prev_of(self.win.clips, c):
-                b = self.junction_btn(c)
+            # fade shading, with a thin diagonal so the fade length reads clearly
+            if c.fin > 0 or c.fout > 0:
+                p.setPen(Qt.NoPen)
+                p.setBrush(self.c_fade)
+                if c.fin > 0:
+                    p.drawPolygon(QPolygonF([r.topLeft(), QPointF(r.left() + c.fin * self.pps, r.top()), r.bottomLeft()]))
+                if c.fout > 0:
+                    p.drawPolygon(QPolygonF([r.topRight(), QPointF(r.right() - c.fout * self.pps, r.top()), r.bottomRight()]))
                 p.setRenderHint(QPainter.Antialiasing, True)
-                p.setBrush(QColor(127, 229, 255))
-                p.setPen(QPen(QColor(20, 20, 24), 2))
-                p.drawEllipse(b)
-                p.setPen(QPen(QColor(20, 20, 24), 2.4))
-                cx, cy = b.center().x(), b.center().y()
-                p.drawLine(QPointF(cx - 5, cy), QPointF(cx + 5, cy))
-                p.drawLine(QPointF(cx, cy - 5), QPointF(cx, cy + 5))
+                p.setPen(self.pen_fade)
+                if c.fin > 0:
+                    p.drawLine(r.bottomLeft(), QPointF(r.left() + c.fin * self.pps, r.top()))
+                if c.fout > 0:
+                    p.drawLine(QPointF(r.right() - c.fout * self.pps, r.top()), r.bottomRight())
                 p.setRenderHint(QPainter.Antialiasing, False)
+            # name band
+            p.fillRect(QRectF(r.left(), r.top(), r.width(), 16), band_t if tiles else band)
+            tr = r.adjusted(6, 0, -4, 0).intersected(QRectF(LBL, r.top(), w, 16))
+            if tr.width() > 4:
+                p.setFont(self.f_small)
+                p.setPen(self.c_band_text)
+                p.drawText(tr, Qt.AlignLeft | Qt.AlignVCenter, fm.elidedText(c.name, Qt.ElideRight, int(tr.width())))
+            p.restore()
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setBrush(Qt.NoBrush)
+            if sel:
+                p.fillPath(path, self.c_lift)
+                p.setPen(self.pen_sel)
+                p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 4, 4)
+            else:
+                p.setPen(self.pen_hov if c is self.hov else QPen(edge, 1))
+                p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
+            if c is dragging:
+                p.fillPath(path, self.c_drag)
+            ti = trans_info(self.win.clips, c)
+            if ti:                       # transition chip: same place as before, so clicking it still works
+                b = QRectF(r.left() - 8, r.center().y() - 8, 16, 16)
+                p.setPen(QPen(TLC["bg"], 1))
+                p.setBrush(TLC["head_text_main"])
+                p.drawRoundedRect(b, 3, 3)
+                cx, cy = b.center().x(), b.center().y()
+                p.setPen(Qt.NoPen)
+                p.setBrush(TLC["head"])
+                p.drawPolygon(QPolygonF([QPointF(cx - 5, cy - 4), QPointF(cx - 5, cy + 4), QPointF(cx, cy)]))   # bow-tie
+                p.drawPolygon(QPolygonF([QPointF(cx + 5, cy - 4), QPointF(cx + 5, cy + 4), QPointF(cx, cy)]))
+            elif c is self.hj and prev_of(self.win.clips, c):
+                b = self.junction_btn(c).adjusted(1, 1, -1, -1)
+                p.setBrush(QColor("#3A78E0"))
+                p.setPen(QPen(TLC["bg"], 2))
+                p.drawEllipse(b)
+                p.setPen(QPen(QColor("#FFFFFF"), 1.8, Qt.SolidLine, Qt.RoundCap))
+                cx, cy = b.center().x(), b.center().y()
+                p.drawLine(QPointF(cx - 4.5, cy), QPointF(cx + 4.5, cy))
+                p.drawLine(QPointF(cx, cy - 4.5), QPointF(cx, cy + 4.5))
+            p.setRenderHint(QPainter.Antialiasing, False)
+        acc = TLC["accent"]
         if self.mode == "marquee" and self.mq:
             q = QRectF(self.mq[0], self.mq[1]).normalized()
-            p.setPen(QPen(QColor(127, 229, 255), 1))
-            p.setBrush(QColor(127, 229, 255, 40))
+            p.setPen(QPen(acc, 1))
+            p.setBrush(self.c_accent_fill)
             p.drawRect(q)
         if self.mode == "move" and self.plan and self.win.sel:
             kind, ref, st = self.plan
@@ -1400,26 +1517,37 @@ class Timeline(QWidget):
             y = RULER + c.track * TH
             if kind in ("before", "after"):          # insertion marker between clips
                 x = self.tx(ref.start if kind == "before" else ref.end)
-                p.setPen(QPen(QColor(127, 229, 255), 3))
+                p.setPen(QPen(acc, 2))
                 p.drawLine(QPointF(x, y + 2), QPointF(x, y + TH - 2))
-                p.setBrush(QColor(127, 229, 255))
+                p.setBrush(acc)
                 p.setPen(Qt.NoPen)
+                p.setRenderHint(QPainter.Antialiasing, True)
                 p.drawPolygon(QPolygonF([QPointF(x - 6, y + 2), QPointF(x + 6, y + 2), QPointF(x, y + 9)]))
+                p.setRenderHint(QPainter.Antialiasing, False)
             elif abs(st - c.start) > 1e-3:           # it will slide to the nearest free spot
-                p.setPen(QPen(QColor(127, 229, 255), 2, Qt.DashLine))
-                p.setBrush(QColor(127, 229, 255, 40))
+                p.setPen(QPen(acc, 1.5, Qt.DashLine))
+                p.setBrush(self.c_accent_fill)
                 p.drawRect(QRectF(self.tx(st), y + 3, c.dur * self.pps, TH - 6))
         p.setClipping(False)
         if not self.win.clips:
-            p.setPen(QColor(120, 120, 135))
-            p.drawText(QRectF(LBL, RULER, w - LBL, TH * len(TRACKS)), Qt.AlignCenter,
-                       'Drag media from the Library onto a track\n(or double-click an item to add it)')
+            area = QRectF(LBL, RULER, w - LBL, TH * nt)
+            cy = area.center().y()
+            p.setFont(self.f_empty)
+            p.setPen(TLC["empty_title"])
+            p.drawText(QRectF(area.left(), cy - 22, area.width(), 20), Qt.AlignCenter,
+                       "Drag media from the Library onto a track")
+            p.setFont(self.f_empty2)
+            p.setPen(TLC["empty"])
+            p.drawText(QRectF(area.left(), cy + 2, area.width(), 18), Qt.AlignCenter,
+                       "or double-click an item to add it")
         # drop hint
         if self.drop_hint:
             tr, t0, d = self.drop_hint
-            p.setPen(QPen(QColor(127, 229, 255), 2, Qt.DashLine))
-            p.setBrush(QColor(127, 229, 255, 40))
-            p.drawRect(QRectF(self.tx(t0), RULER + tr * TH + 3, d * self.pps, TH - 6))
+            p.setPen(QPen(acc, 1.5, Qt.DashLine))
+            p.setBrush(self.c_accent_fill)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.drawRoundedRect(QRectF(self.tx(t0), RULER + tr * TH + 3, d * self.pps, TH - 6), 4, 4)
+            p.setRenderHint(QPainter.Antialiasing, False)
 
     # mouse
     def mousePressEvent(self, ev):
@@ -1845,6 +1973,7 @@ class LibraryList(QListWidget):
         self.setGridSize(QPixmap(136, 100).size())
         self.setDragEnabled(False)          # we start drags ourselves (more reliable than Qt's own)
         self.setDragDropMode(QListWidget.NoDragDrop)
+        self.setObjectName("library")
         self._press = None
         self._drag = None
 
@@ -1937,6 +2066,7 @@ class TransList(QListWidget):
         super().__init__()
         self.addItems(TRANS[1:])
         self.setDragEnabled(False)
+        self.setObjectName("transitions")
         self._press = self._drag = None
 
     def mousePressEvent(self, ev):
@@ -1957,7 +2087,7 @@ class TransList(QListWidget):
                 ghost = QLabel(it.text())
                 ghost.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowTransparentForInput)
                 ghost.setAttribute(Qt.WA_ShowWithoutActivating)
-                ghost.setStyleSheet("background:#7FE5FF;color:#0a0a0e;padding:4px 10px;border-radius:6px;font-weight:bold;")
+                ghost.setStyleSheet("background:#3A78E0;color:#FFFFFF;padding:4px 10px;border-radius:4px;font-weight:600;")
                 ghost.adjustSize()
                 ghost.move(g + QPoint(10, 10))
                 ghost.show()
@@ -2340,6 +2470,16 @@ class PreviewView(QGraphicsView):
 
 # ----------------------------------------------------------------------------- main window
 
+def scrolled(w):
+    """Put a panel page in a scroll area, so tall pages never force a tall window."""
+    sa = QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setFrameShape(QFrame.NoFrame)
+    sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    sa.setWidget(w)
+    return sa
+
+
 CANVAS = {"Vertical 1080x1920": (1080, 1920), "Landscape 1920x1080": (1920, 1080), "Square 1080x1080": (1080, 1080)}
 
 
@@ -2414,7 +2554,11 @@ class MainWindow(QMainWindow):
         b_add.clicked.connect(self.add_selected_lib)
         lib_w = QWidget()
         ll = QVBoxLayout(lib_w)
-        ll.addWidget(QLabel("Drag items onto the timeline"))
+        ll.setContentsMargins(12, 12, 12, 12)
+        ll.setSpacing(8)
+        lib_hint = QLabel("Drag items onto the timeline")
+        lib_hint.setObjectName("hint")
+        ll.addWidget(lib_hint)
         ll.addWidget(self.libview, 1)
         self.conv_q, self.conv_cur, self.conv_t0 = [], None, 0.0
         self.conv_box = QGroupBox("Converting HDR to SDR")
@@ -2424,7 +2568,9 @@ class MainWindow(QMainWindow):
         self.conv_bar = QProgressBar()
         self.conv_bar.setRange(0, 1000)
         self.conv_bar.setTextVisible(False)
+        self.conv_bar.setObjectName("slim")
         self.conv_eta = QLabel("")
+        self.conv_eta.setObjectName("hint")
         b_cc = QPushButton("Cancel conversion")
         b_cc.clicked.connect(self.cancel_conv)
         for wdg in (self.conv_label, self.conv_bar, self.conv_eta, b_cc):
@@ -2435,12 +2581,21 @@ class MainWindow(QMainWindow):
         ll.addWidget(b_add)
         tr_w = QWidget()
         tl_ = QVBoxLayout(tr_w)
-        tl_.addWidget(QLabel("Drag a transition onto a clip\n(the clip must touch the one before it)"))
+        tl_.setContentsMargins(12, 12, 12, 12)
+        tl_.setSpacing(8)
+        tr_hint = QLabel("Drag a transition onto a clip\n(the clip must touch the one before it)")
+        tr_hint.setObjectName("hint")
+        tr_hint.setWordWrap(True)
+        tl_.addWidget(tr_hint)
         self.translist = TransList()
         tl_.addWidget(self.translist, 1)
         cap_w = QWidget()
         cl = QVBoxLayout(cap_w)
-        cl.addWidget(QLabel("Type a caption, then add it to the timeline at the red playhead."))
+        cl.setContentsMargins(12, 12, 12, 12)
+        cl.setSpacing(8)
+        cap_intro = QLabel("Type a caption, then add it to the timeline at the red playhead.")
+        cap_intro.setWordWrap(True)
+        cl.addWidget(cap_intro)
         self.new_cap = QPlainTextEdit()
         self.new_cap.setPlaceholderText("Using people's voices on a soundboard \U0001F480")
         self.new_cap.setFixedHeight(110)
@@ -2454,12 +2609,13 @@ class MainWindow(QMainWindow):
                       "the width of its text, centred, like CapCut. Select a caption on the timeline to change its "
                       "font, size and colours.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color:#888;")
+        hint.setObjectName("hint")
         cl.addWidget(hint)
         cl.addStretch(1)
         left = QTabWidget()
+        left.tabBar().setExpanding(False)
         left.addTab(lib_w, "Library")
-        left.addTab(cap_w, "Captions")
+        left.addTab(scrolled(cap_w), "Captions")
         left.addTab(self.build_sub_left(), "Subtitles")
         left.addTab(tr_w, "Transitions")
 
@@ -2467,7 +2623,7 @@ class MainWindow(QMainWindow):
         self.scene = QGraphicsScene()
         self.xbox = None
         self.view = PreviewView(self.scene, self)
-        self.view.setBackgroundBrush(QColor(14, 14, 16))
+        self.view.setBackgroundBrush(QColor("#111214"))
         self.view.setFrameShape(QGraphicsView.NoFrame)
         self.view.setRenderHint(QPainter.SmoothPixmapTransform)
         self.canvas = None
@@ -2481,21 +2637,27 @@ class MainWindow(QMainWindow):
         pv = QWidget()
         pl = QVBoxLayout(pv)
         pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(0)
         pl.addWidget(self.view, 1)
-        pl.addLayout(self.transport)
+        pl.addWidget(self.transport_bar)
         top = QSplitter(Qt.Horizontal)
         top.addWidget(left)
         top.addWidget(pv)
         top.addWidget(self.props)
-        self.props.setMinimumWidth(400)
-        left.setMinimumWidth(310)
-        top.setSizes([320, 760, 420])
+        self.props.setMinimumWidth(300)
+        left.setMinimumWidth(260)
+        top.setSizes([300, 840, 360])
+        top.setStretchFactor(0, 0)     # the preview takes up any change in window width
+        top.setStretchFactor(1, 1)
+        top.setStretchFactor(2, 0)
+        top.setCollapsible(1, False)
 
         # timeline + scrollbar
         self.tl = Timeline(self)
         self.tl.seek.connect(self.set_time)
         self.tl.selection.connect(self.load_props)
         self.hs = QScrollBar(Qt.Horizontal)
+        self.hs.setObjectName("timelineScroll")
         self.hs.valueChanged.connect(self.on_hscroll)
         tlbox = QWidget()
         tv = QVBoxLayout(tlbox)
@@ -2507,14 +2669,19 @@ class MainWindow(QMainWindow):
         # editing bar above the timeline
         bottom = QWidget()
         bl = QVBoxLayout(bottom)
-        bl.setContentsMargins(6, 4, 6, 4)
-        bl.addLayout(self.editbar)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(0)
+        bl.addWidget(self.editbar_w)
         bl.addWidget(tlbox, 1)
 
         main = QSplitter(Qt.Vertical)
         main.addWidget(top)
         main.addWidget(bottom)
-        main.setSizes([560, 360])
+        main.setStretchFactor(0, 1)    # extra height goes to the preview, not to empty timeline space
+        main.setStretchFactor(1, 0)
+        main.setCollapsible(0, False)
+        main.setCollapsible(1, False)
+        main.setSizes([600, 340])
         root = QWidget()
         rv = QVBoxLayout(root)
         rv.setContentsMargins(0, 0, 0, 0)
@@ -2524,7 +2691,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self.sb_hint = QLabel("Space: play   S: split   Del: delete   Ctrl+Z: undo   Ctrl+wheel: zoom   "
                               "Ctrl+click: select several   Alt: no snapping   Shift: place freely   Esc: cancel a drag")
-        self.sb_hint.setStyleSheet("color:#777;")
         self.statusBar().addPermanentWidget(self.sb_hint)
         self.status("Welcome! Import media to get started.")
 
@@ -2586,8 +2752,8 @@ class MainWindow(QMainWindow):
             b.clicked.connect(fn)
             b.setObjectName(name)
             if icon:
-                b.setIcon(mk_icon(icon, "#0a0a0e" if name == "play" else "#e6e6eb"))
-                b.setIconSize(QSize(18, 18))
+                b.setIcon(mk_icon(icon, "#0a0a0e" if name == "play" else "#C9CBD1"))
+                b.setIconSize(QSize(16, 16))
             if fixed:
                 b.setFixedSize(*fixed)
             b.setCursor(Qt.PointingHandCursor)
@@ -2596,17 +2762,21 @@ class MainWindow(QMainWindow):
         def sep():
             f = QFrame()
             f.setFrameShape(QFrame.VLine)
-            f.setStyleSheet("color:#3a3a44;")
+            f.setObjectName("vsep")
+            f.setFixedHeight(16)
             return f
-        self.b_play = btn("", "Play / pause  (Space)", self.toggle_play, "play", "play", (46, 46))
-        b_start = btn("", "Go to the start  (Home)", lambda: self.set_time(0), "round", "start", (36, 36))
+        self.b_play = btn("", "Play / pause  (Space)", self.toggle_play, "play", "play", (36, 36))
+        b_start = btn("", "Go to the start  (Home)", lambda: self.set_time(0), "round", "start", (28, 28))
         self.lbl_time = QLabel("00:00.00 / 00:00.00")
         self.lbl_time.setObjectName("time")
         self.lbl_time.setMinimumWidth(200)
         self.lbl_time.setAlignment(Qt.AlignCenter)
-        self.transport = QHBoxLayout()
-        self.transport.setContentsMargins(0, 6, 0, 6)
-        self.transport.setSpacing(10)
+        self.transport_bar = QWidget()
+        self.transport_bar.setObjectName("transport")
+        self.transport_bar.setFixedHeight(44)
+        self.transport = QHBoxLayout(self.transport_bar)
+        self.transport.setContentsMargins(12, 4, 12, 4)
+        self.transport.setSpacing(8)
         self.transport.addStretch(1)
         self.transport.addWidget(b_start)
         self.transport.addWidget(self.b_play)
@@ -2617,18 +2787,26 @@ class MainWindow(QMainWindow):
         self.transport.addWidget(self.b_zoomv)
         self.transport.addStretch(1)
 
-        eb = QHBoxLayout()
-        eb.setSpacing(6)
+        self.editbar_w = QWidget()
+        self.editbar_w.setObjectName("toolbar")
+        self.editbar_w.setFixedHeight(40)
+        eb = QHBoxLayout(self.editbar_w)
+        eb.setContentsMargins(8, 6, 8, 6)
+        eb.setSpacing(4)
         eb.addWidget(btn("Undo", "Undo  (Ctrl+Z)", self.do_undo, icon="undo"))
         eb.addWidget(btn("Redo", "Redo  (Ctrl+Y)", self.do_redo, icon="redo"))
+        eb.addSpacing(4)
         eb.addWidget(sep())
+        eb.addSpacing(4)
         eb.addWidget(btn("Split", "Cut the selected clip in two at the red playhead  (S)", self.split, icon="split"))
         eb.addWidget(btn("Delete", "Delete the selected clip  (Del)", self.delete_sel, icon="trash"))
         eb.addWidget(btn("Add gap", "Insert empty space at the playhead: everything after it moves later",
                          self.insert_gap, icon="plus"))
         eb.addWidget(btn("Delete && close gap", "Delete the clip and pull later clips on that track back  "
                          "(Shift+Del)", self.ripple_delete, icon="ripple"))
+        eb.addSpacing(4)
         eb.addWidget(sep())
+        eb.addSpacing(4)
         eb.addWidget(btn("Detach audio", "Split the sound of the selected video into its own audio clip",
                          self.detach_audio, icon="audio"))
         eb.addStretch(1)
@@ -2637,47 +2815,63 @@ class MainWindow(QMainWindow):
         self.ck_snap.setToolTip("Snap clips to each other and to the playhead")
         self.ck_snap.toggled.connect(lambda v: setattr(self.tl, "snap_on", v))
         eb.addWidget(self.ck_snap)
+        eb.addSpacing(8)
         self.ck_ripple = QCheckBox("Magnetic")
         self.ck_ripple.setChecked(True)
         self.ck_ripple.setToolTip("Video track: dropping a clip between others inserts it and the rest shuffle along; "
                                   "gaps close when you move a clip away.  Hold Shift while dropping to place it freely.")
         self.ck_ripple.toggled.connect(lambda v: setattr(self.tl, "ripple", v))
         eb.addWidget(self.ck_ripple)
+        eb.addSpacing(8)
         eb.addWidget(sep())
-        eb.addWidget(btn("", "Zoom out the timeline  (Ctrl+wheel)", lambda: self.zoom(1 / 1.3), "round", "minus", (32, 32)))
-        eb.addWidget(btn("", "Zoom in the timeline  (Ctrl+wheel)", lambda: self.zoom(1.3), "round", "plus", (32, 32)))
+        eb.addSpacing(4)
+        eb.addWidget(btn("", "Zoom out the timeline  (Ctrl+wheel)", lambda: self.zoom(1 / 1.3), "round", "minus", (28, 28)))
+        eb.addWidget(btn("", "Zoom in the timeline  (Ctrl+wheel)", lambda: self.zoom(1.3), "round", "plus", (28, 28)))
         eb.addWidget(btn("Fit", "Zoom to fit the whole project", self.zoom_fit, icon="fit"))
         self.editbar = eb
 
+        def field(text):
+            lab = QLabel(text)
+            lab.setObjectName("field")
+            return lab
         hd = QHBoxLayout()
-        hd.setContentsMargins(12, 8, 12, 8)
+        hd.setContentsMargins(12, 6, 12, 6)
         hd.setSpacing(8)
         t = QLabel("Clip Studio")
         t.setObjectName("title")
         hd.addWidget(t)
         hd.addSpacing(16)
-        hd.addWidget(btn("Open project", "Open a saved project", self.open_project))
-        hd.addWidget(btn("Save project", "Save the project  (Ctrl+S)", self.save_project))
+        hd.addWidget(btn("Open project", "Open a saved project", self.open_project, "ghost"))
+        hd.addWidget(btn("Save project", "Save the project  (Ctrl+S)", self.save_project, "ghost"))
         hd.addStretch(1)
         self.cb_canvas = QComboBox()
         self.cb_canvas.addItems(list(CANVAS))
         self.cb_canvas.setToolTip("Shape of the video you are making")
+        self.cb_canvas.setMinimumWidth(170)
         self.cb_canvas.currentTextChanged.connect(self.set_canvas)
-        hd.addWidget(QLabel("Canvas"))
+        hd.addWidget(field("Canvas"))
         hd.addWidget(self.cb_canvas)
+        hd.addSpacing(12)
         self.cb_fps = QComboBox()
         self.cb_fps.addItems(["30", "60"])
         self.cb_fps.setToolTip("Frame rate of the exported video")
-        hd.addWidget(QLabel("Frame rate"))
+        self.cb_fps.setFixedWidth(72)
+        hd.addWidget(field("Frame rate"))
         hd.addWidget(self.cb_fps)
+        hd.addSpacing(12)
+        hd.addWidget(sep())
+        hd.addSpacing(4)
         self.ck_nv = QCheckBox("GPU (NVENC)")
         self.ck_nv.setToolTip("Faster export on NVIDIA graphics cards")
         hd.addWidget(self.ck_nv)
-        hd.addSpacing(6)
-        hd.addWidget(btn("Export video", "Render the finished video to an MP4 file", self.export, "primary"))
+        hd.addSpacing(12)
+        b_exp = btn("Export video", "Render the finished video to an MP4 file", self.export, "primary")
+        b_exp.setMinimumWidth(112)
+        hd.addWidget(b_exp)
         self.header = QWidget()
         self.header.setLayout(hd)
         self.header.setObjectName("header")
+        self.header.setFixedHeight(44)
 
     def ripple_delete(self):
         cl = self.selected()
@@ -2744,11 +2938,11 @@ class MainWindow(QMainWindow):
         self.scene.clear()
         self.canvas = QGraphicsRectItem(0, 0, self.W, self.H)
         self.canvas.setBrush(QBrush(Qt.black))
-        self.canvas.setPen(QPen(Qt.NoPen))
+        self.canvas.setPen(QPen(QColor("#2A2B30"), 0))   # hairline so the black frame shows on the dark surround
         self.canvas.setFlag(QGraphicsRectItem.ItemClipsChildrenToShape, True)
         self.scene.addItem(self.canvas)
         self.empty_txt = QGraphicsSimpleTextItem("Your video preview\nwill appear here", self.canvas)
-        self.empty_txt.setBrush(QBrush(QColor(110, 110, 125)))
+        self.empty_txt.setBrush(QBrush(QColor("#55575F")))
         f = QFont()
         f.setPixelSize(max(24, self.W // 22))
         self.empty_txt.setFont(f)
@@ -2796,6 +2990,7 @@ class MainWindow(QMainWindow):
             return d
         self.p_name = QLabel("Click a clip on the timeline to edit it")
         self.p_name.setWordWrap(True)
+        self.p_name.setObjectName("panelTitle")
         self.p_fin = ss(0, 5, 0.1, " s")
         self.p_fout = ss(0, 5, 0.1, " s")
         self.p_vol = ss(0, 300, 5, " %", 0)
@@ -2808,24 +3003,30 @@ class MainWindow(QMainWindow):
         self.p_trans.currentTextChanged.connect(self.apply_props)
         self.p_tdur = ss(0.1, 3, 0.1, " s")
         tabs = QTabWidget()
+        tabs.setUsesScrollButtons(True)
+        tabs.tabBar().setExpanding(False)
 
         def tab(title, rows, note=""):
             w = QWidget()
             f = QFormLayout(w)
+            f.setContentsMargins(0, 12, 4, 0)
+            f.setHorizontalSpacing(12)
+            f.setVerticalSpacing(8)
             for lab, wdg in rows:
                 f.addRow(lab, wdg)
             if note:
                 n = QLabel(note)
                 n.setWordWrap(True)
-                n.setStyleSheet("color:#888;")
+                n.setObjectName("hint")
                 f.addRow(n)
-            tabs.addTab(w, title)
+            tabs.addTab(scrolled(w), title)
         tab("Fade", [("Fade in", self.p_fin), ("Fade out", self.p_fout)],
             "Fades the selected clip in from / out to black (and its sound). This is not a transition: it only "
             "affects this clip.")
         rb = QWidget()
         rl = QHBoxLayout(rb)
         rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(8)
         for txt, tip, mode in [("Fit", "Fit the whole clip inside the video", "fit"),
                                ("Fill", "Zoom the clip to cover the whole video", "fill"),
                                ("Reset", "Back to centred and normal size", "reset")]:
@@ -2841,39 +3042,42 @@ class MainWindow(QMainWindow):
         tab("Transition", [("Style", self.p_trans), ("Length", self.p_tdur)],
             "Plays between this clip and the one before it. The clips must be touching. You can also drag a "
             "transition from the Transitions tab onto a clip.")
-        tabs.insertTab(0, self.build_sub_panel(), "Subtitle")
-        tabs.insertTab(0, self.build_caption_panel(), "Caption")
+        tabs.insertTab(0, scrolled(self.build_sub_panel()), "Subtitle")
+        tabs.insertTab(0, scrolled(self.build_caption_panel()), "Caption")
         self.ptabs = tabs
         self.goto_tab("Fade")
-        box = QGroupBox("Selected clip")
-        v = QVBoxLayout(box)
-        v.addWidget(self.p_name)
-        v.addWidget(tabs)
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.addWidget(box)
-        lay.addStretch(1)
+        lay.setContentsMargins(12, 12, 12, 0)
+        lay.setSpacing(4)
+        eyebrow = QLabel("Selected clip")
+        eyebrow.setObjectName("eyebrow")
+        lay.addWidget(eyebrow)
+        lay.addWidget(self.p_name)
+        lay.addSpacing(8)
+        lay.addWidget(tabs, 1)
         return w
 
     def emoji_row(self, edit):
         w = QWidget()
-        g = QHBoxLayout(w)
+        g = QGridLayout(w)            # 6 x 2 grid: fits narrow panels
         g.setContentsMargins(0, 0, 0, 0)
         g.setSpacing(2)
-        for e in EMOJI_PICK:
+        for i, e in enumerate(EMOJI_PICK):
             b = QPushButton(e)
-            b.setFixedSize(30, 30)
-            b.setStyleSheet("QPushButton{padding:0;font-size:16px;font-family:'Segoe UI Emoji','Apple Color Emoji';"
-                            "background:transparent;border:none;}QPushButton:hover{background:#3a3a44;}")
+            b.setFixedSize(28, 28)
+            b.setObjectName("emoji")
             b.setToolTip("Insert this emoji")
             b.clicked.connect(lambda _=False, e=e: (edit.insertPlainText(e), edit.setFocus()))
-            g.addWidget(b)
-        g.addStretch(1)
+            g.addWidget(b, i // 6, i % 6)
+        g.setColumnStretch(6, 1)
         return w
 
     def build_caption_panel(self):
         w = QWidget()
         v = QVBoxLayout(w)
+        v.setContentsMargins(0, 12, 4, 0)
+        v.setSpacing(8)
         self.cap_edit = QPlainTextEdit()
         self.cap_edit.setPlaceholderText("Select a caption on the timeline to edit its text")
         self.cap_edit.setFixedHeight(84)
@@ -2882,6 +3086,8 @@ class MainWindow(QMainWindow):
         v.addWidget(self.emoji_row(self.cap_edit))
         f = QFormLayout()
         self.cap_font = QFontComboBox()
+        self.cap_font.setMinimumContentsLength(12)
+        self.cap_font.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.cap_font.setCurrentFont(QFont(default_font()))
         self.cap_font.currentFontChanged.connect(lambda *_: self.apply_caption())
         self.cap_size = SliderSpin(24, 160, 2, " px", 0)
@@ -2897,12 +3103,16 @@ class MainWindow(QMainWindow):
         b_font = QPushButton("Load font file...")
         b_font.setToolTip("Add a font from a .ttf / .otf file (e.g. Montserrat or Proxima Nova)")
         b_font.clicked.connect(self.load_font)
+        f.setHorizontalSpacing(12)
+        f.setVerticalSpacing(8)
+        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         f.addRow("Font", self.cap_font)
         f.addRow("", b_font)
         f.addRow("Size", self.cap_size)
         f.addRow("Boldness", self.cap_bold)
         f.addRow(self.cap_box)
         row = QHBoxLayout()
+        row.setSpacing(8)
         row.addWidget(self.cap_bcol)
         row.addWidget(self.cap_tcol)
         f.addRow(row)
@@ -2910,7 +3120,7 @@ class MainWindow(QMainWindow):
         n = QLabel("Each line gets its own box that hugs the text. Press Enter for a new line. Drag the caption in "
                    "the preview to move it.")
         n.setWordWrap(True)
-        n.setStyleSheet("color:#888;")
+        n.setObjectName("hint")
         v.addWidget(n)
         v.addStretch(1)
         self.cap_widgets = [self.cap_edit, self.cap_font, self.cap_size, self.cap_bold, self.cap_box, self.cap_bcol, self.cap_tcol]
@@ -2938,6 +3148,8 @@ class MainWindow(QMainWindow):
     def build_sub_panel(self):
         w = QWidget()
         v = QVBoxLayout(w)
+        v.setContentsMargins(0, 12, 4, 0)
+        v.setSpacing(8)
         v.addWidget(QLabel("Subtitle text"))
         self.sub_edit = QPlainTextEdit()
         self.sub_edit.setPlaceholderText("Select a subtitle on the Subtitles track to edit its words")
@@ -2945,6 +3157,7 @@ class MainWindow(QMainWindow):
         self.sub_edit.textChanged.connect(self.apply_sub_text)
         v.addWidget(self.sub_edit)
         qr = QHBoxLayout()
+        qr.setSpacing(8)
         b1 = QPushButton("(Parrot Replay)")
         b1.setToolTip("Replace this subtitle's text with (Parrot Replay)")
         b1.clicked.connect(lambda: self.sub_edit.setPlainText("(Parrot Replay)"))
@@ -2964,7 +3177,7 @@ class MainWindow(QMainWindow):
                    "corner to resize it. The look (font, colours, animation) is set in the Subtitles tab on the "
                    "left and applies to every subtitle. For emojis use a Caption instead.")
         n.setWordWrap(True)
-        n.setStyleSheet("color:#888;")
+        n.setObjectName("hint")
         v.addWidget(n)
         v.addStretch(1)
         return w
@@ -2984,11 +3197,14 @@ class MainWindow(QMainWindow):
         self.sub_maxwords.setValue(4)
         self.sub_selonly = QCheckBox("Selected clip only")
         self.sub_selonly.setToolTip("Untick = subtitle the whole timeline (every clip with sound)")
-        b = QPushButton("Generate subtitles for the whole timeline")
+        b = QPushButton("Generate subtitles")
+        b.setToolTip("Transcribe every clip with sound on the timeline (not the Music track), or only the selected "
+                     "clip when 'Selected clip only' is ticked.")
         b.setObjectName("primary")
         b.clicked.connect(self.generate_subtitles)
         gen = QGroupBox("Auto subtitles")
         gf = QFormLayout(gen)
+        self._form_style(gf)
         gf.addRow("Model", self.sub_model)
         gf.addRow("Language", self.sub_lang)
         gf.addRow("Words per subtitle", self.sub_maxwords)
@@ -3001,10 +3217,12 @@ class MainWindow(QMainWindow):
         hint = QLabel("Subtitles every clip with sound on the timeline (not the Music track). They appear on the "
                       "Subtitles track at the bottom; drag them to retime. The first run downloads the speech model.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color:#888;")
+        hint.setObjectName("hint")
         gf.addRow(hint)
 
         self.sub_font = QFontComboBox()
+        self.sub_font.setMinimumContentsLength(12)
+        self.sub_font.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.sub_font.setCurrentFont(QFont("Rubik" if "Rubik" in fams else "Arial"))
         self.sub_bold = QCheckBox("Bold")
         self.sub_bold.setChecked(True)
@@ -3035,6 +3253,7 @@ class MainWindow(QMainWindow):
         self.sub_anim_ms.setValue(200)
         sty = QGroupBox("Subtitle look (all subtitles)")
         sf = QFormLayout(sty)
+        self._form_style(sf)
         sf.addRow("Font", self.sub_font)
         r2 = QHBoxLayout()
         r2.addWidget(self.sub_bold)
@@ -3071,6 +3290,8 @@ class MainWindow(QMainWindow):
             cb.changed.connect(self.sub_changed)
         inner = QWidget()
         iv = QVBoxLayout(inner)
+        iv.setContentsMargins(12, 0, 12, 12)
+        iv.setSpacing(8)
         iv.addWidget(gen)
         iv.addWidget(sty)
         iv.addStretch(1)
@@ -3078,8 +3299,18 @@ class MainWindow(QMainWindow):
         sa.setWidgetResizable(True)
         sa.setWidget(inner)
         sa.setFrameShape(QFrame.NoFrame)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.load_sub_defaults()
         return sa
+
+    @staticmethod
+    def _form_style(f):
+        """Forms in narrow panels: fields stretch, long rows wrap instead of being cut off."""
+        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        f.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        f.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        f.setHorizontalSpacing(12)
+        f.setVerticalSpacing(8)
 
     SUB_DEF_FILE = os.path.join(os.path.expanduser("~"), ".clip_studio", "sub_defaults.json")
 
@@ -4202,60 +4433,264 @@ class MainWindow(QMainWindow):
 # ----------------------------------------------------------------------------- app
 
 
+UI_DIR = os.path.join(os.path.expanduser("~"), ".clip_studio", "ui")
+
+
+def make_ui_assets():
+    """Arrow / check images for the stylesheet, drawn in code (QSS needs image files)."""
+    d = UI_DIR
+    try:
+        os.makedirs(d, exist_ok=True)
+        if not os.access(d, os.W_OK):
+            raise OSError
+    except Exception:
+        d = tempfile.mkdtemp(prefix="clipstudio_ui_")
+    P = QPointF
+
+    def save(name, color, pts, width=1.5, s=36):
+        pm = QPixmap(s, s)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.scale(s / 12.0, s / 12.0)                       # draw on a 12x12 grid
+        p.setPen(QPen(QColor(color), width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.drawPolyline(QPolygonF([P(*xy) for xy in pts]))
+        p.end()
+        pm.save(os.path.join(d, name + ".png"))
+
+    shapes = {"chev_down": [(3, 4.5), (6, 7.5), (9, 4.5)], "chev_up": [(3, 7.5), (6, 4.5), (9, 7.5)],
+              "chev_right": [(4.5, 3), (7.5, 6), (4.5, 9)], "chev_left": [(7.5, 3), (4.5, 6), (7.5, 9)]}
+    for nm, pts in shapes.items():
+        save(nm, "#A6A8B0", pts)
+        save(nm + "_dis", "#4F5158", pts)
+    chk = [(2.5, 6.2), (5, 8.6), (9.5, 3.6)]
+    save("check", "#FFFFFF", chk, 1.8)
+    save("check_dis", "#6F7D96", chk, 1.8)
+    save("check_menu", "#E8E9EC", chk, 1.6)
+    return d.replace("\\", "/")
+
+
+# The whole look of the app. A plain string (not an f-string) because of the braces; @UI@ is replaced with the
+# folder holding the arrow / check images made by make_ui_assets().
+QSS = """
+* { outline: 0; }
+QMainWindow, QDialog { background: #1B1C1F; }
+QToolTip { background: #2A2B30; color: #E8E9EC; border: 1px solid #3A3B42; padding: 4px 8px; font-size: 11px; }
+
+/* ---------- named labels / containers ---------- */
+QWidget#header { background: #1B1C1F; border-bottom: 1px solid #26272C; }
+QWidget#transport { background: #1B1C1F; border-top: 1px solid #26272C; }
+QWidget#toolbar { background: #1B1C1F; border-bottom: 1px solid #26272C; }
+QLabel#title { font-size: 14px; font-weight: 600; color: #E8E9EC; padding-right: 8px; }
+QLabel#time { font-family: "Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono", monospace;
+              font-size: 13px; color: #E8E9EC; }
+QLabel#hint { color: #767880; font-size: 11px; }
+QLabel#field { color: #A6A8B0; }
+QLabel#eyebrow { color: #767880; font-size: 11px; }
+QLabel#panelTitle { color: #E8E9EC; font-size: 13px; font-weight: 600; }
+QFrame#vsep { color: #2E2F35; }
+
+/* ---------- buttons ---------- */
+QPushButton { background: #2A2B30; color: #E8E9EC; border: 1px solid #34353B; border-radius: 4px;
+              padding: 4px 12px; min-height: 18px; }
+QPushButton:hover { background: #33343A; border-color: #45464E; }
+QPushButton:pressed { background: #232428; border-color: #45464E; }
+QPushButton:checked { background: #1F3253; border-color: #3A78E0; }
+QPushButton:disabled { background: #222327; border-color: #2A2B30; color: #4F5158; }
+
+QPushButton#primary { background: #3A78E0; border: 1px solid #3A78E0; color: #FFFFFF; font-weight: 600; padding: 4px 16px; }
+QPushButton#primary:hover { background: #4886EC; border-color: #4886EC; }
+QPushButton#primary:pressed { background: #2F67C4; border-color: #2F67C4; }
+QPushButton#primary:disabled { background: #26334A; border-color: #26334A; color: #6F7D96; }
+
+QPushButton#danger { background: transparent; border: 1px solid #5A2A2D; color: #F07A7E; }
+QPushButton#danger:hover { background: #3A1D20; border-color: #E5484D; color: #F59EA1; }
+QPushButton#danger:pressed { background: #4A2226; }
+
+QPushButton#ghost, QPushButton#tool { background: transparent; border: 1px solid transparent; color: #C9CBD1;
+              padding: 4px 8px; }
+QPushButton#ghost { padding: 4px 10px; }
+QPushButton#ghost:hover, QPushButton#tool:hover { background: #2A2B30; color: #E8E9EC; border-color: transparent; }
+QPushButton#ghost:pressed, QPushButton#tool:pressed { background: #232428; }
+QPushButton#ghost:disabled, QPushButton#tool:disabled { background: transparent; color: #4F5158; }
+
+QPushButton#round { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 0; min-height: 0; }
+QPushButton#round:hover { background: #2A2B30; }
+QPushButton#round:pressed { background: #232428; }
+
+QPushButton#play { background: #E8E9EC; border: none; border-radius: 18px; padding: 0; min-height: 0; }
+QPushButton#play:hover { background: #FFFFFF; }
+QPushButton#play:pressed { background: #C9CBD1; }
+
+QPushButton#emoji { background: transparent; border: none; border-radius: 4px; padding: 0; min-height: 0;
+              font-size: 16px; font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"; }
+QPushButton#emoji:hover { background: #2A2B30; }
+QPushButton#emoji:pressed { background: #33343A; }
+
+QPushButton#swatch { text-align: left; padding: 4px 8px; color: #C9CBD1; font-size: 11px;
+              font-family: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace; }
+
+QToolButton { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 2px; color: #C9CBD1; }
+QToolButton:hover { background: #2A2B30; }
+QToolButton:pressed { background: #232428; }
+
+/* ---------- dialogs ---------- */
+QMessageBox QLabel#qt_msgbox_label { min-width: 320px; color: #E8E9EC; }
+QMessageBox QLabel#qt_msgbox_informativelabel { color: #A6A8B0; }
+QMessageBox QPushButton, QInputDialog QPushButton, QProgressDialog QPushButton { min-width: 72px; }
+QMessageBox QPushButton:default, QInputDialog QPushButton:default {
+              background: #3A78E0; border-color: #3A78E0; color: #FFFFFF; font-weight: 600; }
+QMessageBox QPushButton:default:hover, QInputDialog QPushButton:default:hover { background: #4886EC; border-color: #4886EC; }
+
+/* ---------- text inputs ---------- */
+QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox, QComboBox {
+              background: #141518; color: #E8E9EC; border: 1px solid #34353B; border-radius: 4px;
+              selection-background-color: #2F67C4; selection-color: #FFFFFF; }
+QLineEdit, QAbstractSpinBox { padding: 4px 6px; min-height: 18px; }
+QPlainTextEdit, QTextEdit { padding: 4px; }
+QLineEdit:hover, QPlainTextEdit:hover, QAbstractSpinBox:hover, QComboBox:hover { border-color: #45464E; }
+QLineEdit:focus, QPlainTextEdit:focus, QAbstractSpinBox:focus, QComboBox:focus, QComboBox:on { border-color: #4886EC; }
+QLineEdit:disabled, QPlainTextEdit:disabled, QAbstractSpinBox:disabled, QComboBox:disabled {
+              background: #18191C; color: #4F5158; border-color: #26272C; }
+
+/* spin boxes */
+QAbstractSpinBox { padding-right: 20px; }
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
+              subcontrol-origin: border; width: 18px; border: none; border-left: 1px solid #2A2B30; background: transparent; }
+QAbstractSpinBox::up-button { subcontrol-position: top right; border-top-right-radius: 4px; }
+QAbstractSpinBox::down-button { subcontrol-position: bottom right; border-bottom-right-radius: 4px; }
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover { background: #2A2B30; }
+QAbstractSpinBox::up-button:pressed, QAbstractSpinBox::down-button:pressed { background: #33343A; }
+QAbstractSpinBox::up-arrow { image: url("@UI@/chev_up.png"); width: 8px; height: 8px; }
+QAbstractSpinBox::down-arrow { image: url("@UI@/chev_down.png"); width: 8px; height: 8px; }
+QAbstractSpinBox::up-arrow:disabled, QAbstractSpinBox::up-arrow:off { image: url("@UI@/chev_up_dis.png"); }
+QAbstractSpinBox::down-arrow:disabled, QAbstractSpinBox::down-arrow:off { image: url("@UI@/chev_down_dis.png"); }
+
+/* combo boxes (QFontComboBox inherits) */
+QComboBox { padding: 4px 24px 4px 8px; min-height: 18px; combobox-popup: 0; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: center right; width: 20px; border: none; }
+QComboBox::down-arrow { image: url("@UI@/chev_down.png"); width: 10px; height: 10px; }
+QComboBox::down-arrow:disabled { image: url("@UI@/chev_down_dis.png"); }
+QComboBox QAbstractItemView { background: #222327; color: #E8E9EC; border: 1px solid #34353B; padding: 4px;
+              outline: 0; selection-background-color: #3A78E0; selection-color: #FFFFFF; }
+QComboBox QAbstractItemView::item { min-height: 24px; padding: 0 8px; border-radius: 3px; }
+QComboBox QAbstractItemView::item:hover, QComboBox QAbstractItemView::item:selected { background: #3A78E0; color: #FFFFFF; }
+
+/* ---------- check boxes ---------- */
+QCheckBox { spacing: 8px; color: #E8E9EC; background: transparent; }
+QCheckBox:disabled { color: #4F5158; }
+QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid #4A4B53; border-radius: 3px; background: #141518; }
+QCheckBox::indicator:hover { border-color: #6A6C75; }
+QCheckBox::indicator:checked { background: #3A78E0; border-color: #3A78E0; image: url("@UI@/check.png"); }
+QCheckBox::indicator:checked:hover { background: #4886EC; border-color: #4886EC; }
+QCheckBox::indicator:disabled { background: #18191C; border-color: #2A2B30; }
+QCheckBox::indicator:checked:disabled { background: #2A3346; border-color: #2A3346; image: url("@UI@/check_dis.png"); }
+
+/* ---------- sliders ---------- */
+QSlider { background: transparent; min-height: 20px; }
+QSlider::groove:horizontal { height: 4px; background: #34353B; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #3A78E0; border-radius: 2px; }
+QSlider::add-page:horizontal { background: #34353B; border-radius: 2px; }
+QSlider::handle:horizontal { width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; background: #E8E9EC; }
+QSlider::handle:horizontal:hover { background: #FFFFFF; }
+QSlider::handle:horizontal:pressed { background: #C9D9F7; }
+QSlider::sub-page:horizontal:disabled { background: #3A3B42; }
+QSlider::handle:horizontal:disabled { background: #4F5158; }
+
+/* ---------- tabs: flat underline ---------- */
+QTabWidget::pane { border: none; border-top: 1px solid #26272C; top: -1px; background: transparent; }
+QTabWidget::tab-bar { left: 8px; }
+QTabBar { qproperty-drawBase: 0; background: transparent; }
+QTabBar::tab { background: transparent; color: #A6A8B0; border: none; border-bottom: 2px solid transparent;
+              padding: 8px 6px 6px 6px; margin-right: 2px; }
+QTabBar::tab:hover { color: #E8E9EC; }
+QTabBar::tab:selected { color: #E8E9EC; border-bottom-color: #3A78E0; }
+QTabBar::tab:disabled { color: #4F5158; }
+QTabBar QToolButton { background: #1B1C1F; border: none; border-radius: 0; width: 16px; }
+QTabBar QToolButton::left-arrow { image: url("@UI@/chev_left.png"); width: 8px; height: 8px; }
+QTabBar QToolButton::right-arrow { image: url("@UI@/chev_right.png"); width: 8px; height: 8px; }
+
+/* ---------- lists ---------- */
+QListWidget { background: #141518; border: 1px solid #26272C; border-radius: 6px; padding: 4px; outline: 0; color: #E8E9EC; }
+QListWidget::item { border-radius: 4px; padding: 4px 6px; color: #E8E9EC; }
+QListWidget::item:hover { background: #222327; }
+QListWidget::item:selected { background: #1F3253; color: #E8E9EC; }
+QListWidget::item:disabled { color: #4F5158; }
+QListWidget#transitions::item { min-height: 22px; padding: 3px 10px; }
+QListWidget#library::item { padding: 4px; margin: 2px; }
+
+/* ---------- group boxes: section header with hairline, no box ---------- */
+QGroupBox { border: none; border-top: 1px solid #26272C; margin-top: 22px; padding-top: 10px; background: transparent; }
+QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 0; padding: 0 0 4px 0; color: #E8E9EC; }
+
+/* ---------- scroll areas & bars ---------- */
+QScrollArea { background: transparent; border: none; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+QScrollBar:horizontal { height: 10px; background: transparent; margin: 0; border: none; }
+QScrollBar:vertical { width: 10px; background: transparent; margin: 0; border: none; }
+QScrollBar::handle:horizontal { background: #3A3B42; border-radius: 3px; min-width: 32px; margin: 2px; }
+QScrollBar::handle:vertical { background: #3A3B42; border-radius: 3px; min-height: 32px; margin: 2px; }
+QScrollBar::handle:hover { background: #4F5158; }
+QScrollBar::handle:pressed { background: #62646C; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; border: none; background: none; }
+QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+QScrollBar#timelineScroll:horizontal { height: 12px; background: #141518; border-top: 1px solid #26272C; }
+
+/* ---------- menus ---------- */
+QMenu { background: #222327; color: #E8E9EC; border: 1px solid #34353B; padding: 4px; }
+QMenu::item { padding: 6px 24px 6px 28px; border-radius: 4px; background: transparent; }
+QMenu::item:selected { background: #3A78E0; color: #FFFFFF; }
+QMenu::item:disabled { color: #4F5158; background: transparent; }
+QMenu::separator { height: 1px; background: #34353B; margin: 4px 8px; }
+QMenu::indicator { width: 14px; height: 14px; padding-left: 8px; }
+QMenu::indicator:checked { image: url("@UI@/check_menu.png"); }
+QMenu::right-arrow { image: url("@UI@/chev_right.png"); width: 8px; height: 8px; margin-right: 8px; }
+
+/* ---------- splitter ---------- */
+QSplitter::handle { background: #111214; }
+QSplitter::handle:horizontal { width: 4px; }
+QSplitter::handle:vertical { height: 4px; }
+QSplitter::handle:hover { background: #2A2B30; }
+QSplitter::handle:pressed { background: #3A78E0; }
+
+/* ---------- status bar ---------- */
+QStatusBar { background: #1B1C1F; color: #A6A8B0; border-top: 1px solid #26272C; min-height: 24px; font-size: 11px; }
+QStatusBar::item { border: none; }
+QStatusBar QLabel { color: #767880; font-size: 11px; padding: 0 8px; }
+
+/* ---------- progress ---------- */
+QProgressBar { background: #141518; border: 1px solid #26272C; border-radius: 4px; text-align: center;
+              color: #E8E9EC; min-height: 16px; max-height: 16px; font-size: 11px; }
+QProgressBar::chunk { background: #3A78E0; border-radius: 3px; }
+QProgressBar#slim { min-height: 6px; max-height: 6px; border: none; background: #2A2B30; border-radius: 3px; }
+QProgressBar#slim::chunk { border-radius: 3px; }
+"""
+
+
 def dark_theme(app):
     app.setStyle("Fusion")
+    f = QFont()
+    f.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Inter", "SF Pro Text", "Helvetica Neue", "Noto Sans",
+                   "DejaVu Sans"])
+    f.setPixelSize(12)
+    app.setFont(f)
     p = QPalette()
     c = QColor
-    p.setColor(QPalette.Window, c(30, 30, 34))
-    p.setColor(QPalette.WindowText, c(230, 230, 235))
-    p.setColor(QPalette.Base, c(22, 22, 26))
-    p.setColor(QPalette.AlternateBase, c(34, 34, 40))
-    p.setColor(QPalette.Text, c(230, 230, 235))
-    p.setColor(QPalette.Button, c(48, 48, 56))
-    p.setColor(QPalette.ButtonText, c(230, 230, 235))
-    p.setColor(QPalette.ToolTipBase, c(45, 45, 52))
-    p.setColor(QPalette.ToolTipText, c(230, 230, 235))
-    p.setColor(QPalette.Highlight, c(127, 229, 255))
-    p.setColor(QPalette.HighlightedText, c(10, 10, 14))
-    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
-        p.setColor(QPalette.Disabled, role, c(110, 110, 118))
+    for role, hx in [(QPalette.Window, "#1B1C1F"), (QPalette.WindowText, "#E8E9EC"), (QPalette.Base, "#141518"),
+                     (QPalette.AlternateBase, "#1F2024"), (QPalette.Text, "#E8E9EC"), (QPalette.Button, "#2A2B30"),
+                     (QPalette.ButtonText, "#E8E9EC"), (QPalette.BrightText, "#FFFFFF"),
+                     (QPalette.ToolTipBase, "#2A2B30"), (QPalette.ToolTipText, "#E8E9EC"),
+                     (QPalette.Highlight, "#3A78E0"), (QPalette.HighlightedText, "#FFFFFF"),
+                     (QPalette.Link, "#7EAAF6"), (QPalette.PlaceholderText, "#6B6D76"),
+                     (QPalette.Light, "#3A3B42"), (QPalette.Midlight, "#2E2F35"), (QPalette.Mid, "#26272C"),
+                     (QPalette.Dark, "#111214"), (QPalette.Shadow, "#000000")]:
+        p.setColor(role, c(hx))
+    for role, hx in [(QPalette.WindowText, "#4F5158"), (QPalette.Text, "#4F5158"), (QPalette.ButtonText, "#4F5158"),
+                     (QPalette.PlaceholderText, "#3F4147"), (QPalette.Base, "#18191C"), (QPalette.Button, "#222327"),
+                     (QPalette.Highlight, "#2A3346")]:
+        p.setColor(QPalette.Disabled, role, c(hx))
     app.setPalette(p)
-    app.setStyleSheet("""
-QGroupBox{border:1px solid #3a3a44;margin-top:12px;padding-top:10px;border-radius:6px;}
-QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 4px;}
-QPushButton{padding:6px 12px;border:1px solid #44444e;border-radius:6px;background:#34343c;}
-QPushButton:hover{background:#42424c;border-color:#5a5a68;}
-QPushButton:pressed{background:#2a2a32;}
-QPushButton#tool{padding:6px 11px;background:#2c2c33;border:1px solid #3b3b44;border-radius:6px;}
-QPushButton#tool:hover{background:#3a3a44;border-color:#55556a;}
-QPushButton#round{background:#2c2c33;border:1px solid #3b3b44;border-radius:18px;padding:0;}
-QPushButton#round:hover{background:#3a3a44;}
-QPushButton#play{background:#7FE5FF;border:none;border-radius:23px;padding:0;}
-QPushButton#play:hover{background:#a8f0ff;}
-QPushButton#primary{background:#2a7de1;border-color:#2a7de1;color:white;font-weight:bold;padding:7px 18px;}
-QPushButton#primary:hover{background:#3d8cf0;}
-QLabel#title{font-size:16px;font-weight:bold;color:#7FE5FF;}
-QLabel#time{font-family:Consolas,monospace;font-size:14px;color:#ddd;}
-QWidget#header{background:#26262c;border-bottom:1px solid #1a1a1e;}
-QTabWidget::pane{border:1px solid #3a3a44;border-radius:4px;top:-1px;}
-QTabBar::tab{padding:7px 8px;background:#2a2a30;border:1px solid #3a3a44;border-bottom:none;
-  border-top-left-radius:6px;border-top-right-radius:6px;margin-right:2px;color:#aaa;}
-QTabBar::tab:selected{background:#34343c;color:white;border-bottom:2px solid #7FE5FF;}
-QSlider::groove:horizontal{height:4px;background:#44444e;border-radius:2px;}
-QSlider::sub-page:horizontal{background:#7FE5FF;border-radius:2px;}
-QSlider::handle:horizontal{width:14px;height:14px;margin:-6px 0;border-radius:7px;background:#eee;}
-QListWidget{border:1px solid #3a3a44;border-radius:6px;}
-QListWidget::item:selected{background:#2d4a56;border-radius:4px;}
-QComboBox,QDoubleSpinBox,QSpinBox{padding:3px 6px;border:1px solid #44444e;border-radius:4px;background:#26262c;}
-QToolTip{background:#2d2d35;color:#eee;border:1px solid #555;padding:4px;}
-QStatusBar{background:#222227;color:#bbb;}
-QSplitter::handle{background:#1a1a1e;}
-QProgressBar{border:1px solid #44444e;border-radius:5px;background:#1e1e22;height:12px;}
-QProgressBar::chunk{background:#7FE5FF;border-radius:4px;}
-QScrollBar:horizontal{height:12px;background:#1e1e22;}
-QScrollBar::handle:horizontal{background:#44444e;border-radius:5px;min-width:30px;}
-QScrollBar::add-line,QScrollBar::sub-line{width:0;}
-""")
+    app.setStyleSheet(QSS.replace("@UI@", make_ui_assets()))
 
 
 def main():
