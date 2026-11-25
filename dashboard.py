@@ -1,31 +1,37 @@
 """Parrot Studio project dashboard: the home screen listing projects as cards.
 
 The dashboard manages projects on disk itself (rename, delete, recents, projects folder) through project_store and
-asks the main window to open things through signals; it never touches the editor.
-Every dialog goes through a small method (ask_text, confirm, pick_file, pick_dir, warn) so tests can replace them.
+asks the main window to open or create projects through signals; it never touches the editor.
+Dialogs are made from the classes in `self.dlg` (by default the PySide6 widgets module; the main window passes its
+own module, so tests that replace QMessageBox / QFileDialog / QMenu there cover the dashboard too).
 """
+import json
 import os
 import subprocess
 import sys
-import time
 
+from PySide6 import QtWidgets
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
-from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
-                               QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
+from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen,
+                           QPixmap, QPolygonF)
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QSizePolicy,
+                               QToolButton, QVBoxLayout, QWidget)
 
 import project_store as store
 
-BRAND = "#7FE5FF"
-CARD_MIN, CARD_MAX, GAP, TEXT_H = 220, 300, 20, 58
+CARD_MIN, CARD_MAX, CARD_LO = 220, 300, 200
+GAP_X, GAP_Y, META_H, RING = 16, 20, 64, 3      # RING: room around each card for the keyboard-focus ring
+CONTENT_MAX = 1320
 
-COL = dict(card="#1F2024", card_hover="#25262B", edge="#2A2B30", edge_hover="#3A3B42", sel="#3A78E0",
-           thumb="#141518", text="#E8E9EC", sub="#8A8C94", dim="#55575F", bad="#F07A7E",
-           badge_bg="#3A2E12", badge_fg="#F5C060")
+COL = dict(page="#141518", card="#1B1C1F", card_hover="#202125", card_down="#232428", edge="#26272C",
+           edge_hover="#45464E", thumb="#0E0F11", empty_thumb="#17181B", text="#E8E9EC", sub="#767880",
+           muted="#A6A8B0", dim="#4F5158", cyan="#7FE5FF", blue="#3A78E0", blue_hover="#4886EC", warn="#E2A33B")
 
 
 def reveal_in_file_manager(path):
     """Show a file (selected) or folder in Explorer / Finder / the desktop's file manager."""
+    if not path:
+        return False
     try:
         if os.path.isfile(path) and sys.platform.startswith("win"):
             subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
@@ -52,58 +58,219 @@ def _font(px, weight=QFont.Normal):
     return f
 
 
-def paint_placeholder(p, r, dim=False):
-    """Tasteful stand-in for a project without a thumbnail: a quiet gradient and a play mark in the brand cyan."""
-    from PySide6.QtGui import QLinearGradient
-    g = QLinearGradient(r.topLeft(), r.bottomRight())
-    g.setColorAt(0, QColor("#1D252B"))
-    g.setColorAt(1, QColor("#16171A"))
-    p.fillRect(r, g)
-    s = min(r.width(), r.height()) * 0.30
+def aspect_label(w, h):
+    if not w or not h:
+        return ""
+    r = w / h
+    for lab, v in (("9:16", 9 / 16), ("16:9", 16 / 9), ("1:1", 1.0), ("4:5", 0.8), ("4:3", 4 / 3)):
+        if abs(r - v) < 0.02:
+            return lab
+    return f"{w}x{h}"
+
+
+def fmt_dur(t):
+    t = int(round(t))
+    return f"{t // 3600}:{t // 60 % 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60}:{t % 60:02d}"
+
+
+_summary_cache = {}
+
+
+def project_summary(path):
+    """(W, H, length in seconds) of a project, read cheaply and cached by modification time. (0, 0, 0) if unknown."""
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return 0, 0, 0.0
+    if key not in _summary_cache:
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                d = json.load(f)
+            ln = max([float(c.get("start", 0)) + float(c.get("dur", 0)) for c in d.get("clips", [])] + [0.0])
+            _summary_cache[key] = (int(d.get("W", 0)), int(d.get("H", 0)), ln)
+        except Exception:
+            _summary_cache[key] = (0, 0, 0.0)
+    return _summary_cache[key]
+
+
+def blurred(pm, size):
+    """A soft, darkened 'cover' copy of pm for the bands beside a portrait thumbnail."""
+    cover = pm.scaled(size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    small = cover.scaled(max(1, cover.width() // 8), max(1, cover.height() // 8), Qt.IgnoreAspectRatio,
+                         Qt.SmoothTransformation)
+    return small.scaled(cover.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+
+def paint_thumbnail(p, r, pm, w, h):
+    """Draw a project picture into the 16:9 area r: 'contain' scaling; side bands get a blurred copy."""
+    p.save()
+    p.setClipRect(r, Qt.IntersectClip)
+    p.fillRect(r, QColor(COL["thumb"]))
+    sz = pm.size() / max(1.0, pm.devicePixelRatio())
+    fit = sz.scaled(r.size().toSize(), Qt.KeepAspectRatio)
+    dst = QRectF(r.x() + (r.width() - fit.width()) / 2, r.y() + (r.height() - fit.height()) / 2,
+                 fit.width(), fit.height())
+    if fit.width() < r.width() - 2 or fit.height() < r.height() - 2:
+        b = blurred(pm, r.size().toSize())
+        p.drawPixmap(QRectF(r.x() + (r.width() - b.width()) / 2, r.y() + (r.height() - b.height()) / 2,
+                            b.width(), b.height()), b, QRectF(b.rect()))
+        p.fillRect(r, QColor(14, 15, 17, 166))
+    p.drawPixmap(dst, pm, QRectF(pm.rect()))
+    if dst.width() < r.width() - 2:
+        p.setPen(QPen(QColor(255, 255, 255, 15), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(dst.adjusted(0.5, 0.5, -0.5, -0.5))
+    p.restore()
+
+
+def paint_empty_thumb(p, r, w, h, text="Empty project"):
+    """No picture yet: the outline of the project's canvas shape."""
+    p.fillRect(r, QColor(COL["empty_thumb"]))
+    w, h = (w or 1080), (h or 1920)
+    fh = r.height() * 0.52
+    fw = fh * w / h
+    if fw > r.width() * 0.5:
+        fw = r.width() * 0.5
+        fh = fw * h / w
     c = r.center()
-    col = QColor(BRAND)
-    col.setAlpha(70 if dim else 150)
-    p.setPen(QPen(col, 1.6))
+    box = QRectF(c.x() - fw / 2, c.y() - fh / 2 - 8, fw, fh)
+    p.setPen(QPen(QColor("#3A3B42"), 1.5))
     p.setBrush(Qt.NoBrush)
-    p.drawRoundedRect(QRectF(c.x() - s * 0.8, c.y() - s * 0.55, s * 1.6, s * 1.1), 6, 6)
+    p.drawRoundedRect(box, 3, 3)
+    p.setFont(_font(11))
+    p.setPen(QColor(COL["dim"]))
+    p.drawText(QRectF(r.x(), box.bottom() + 6, r.width(), 16), Qt.AlignHCenter | Qt.AlignTop, text)
+
+
+def paint_badge(p, text, x, y, right=False):
+    f = _font(10, QFont.DemiBold)
+    p.setFont(f)
+    bw = QFontMetrics(f).horizontalAdvance(text) + 12
+    b = QRectF(x - bw if right else x, y - 18, bw, 18)
     p.setPen(Qt.NoPen)
-    p.setBrush(col)
-    t = s * 0.26
-    p.drawPolygon(QPolygonF([QPointF(c.x() - t * 0.8, c.y() - t), QPointF(c.x() - t * 0.8, c.y() + t),
-                             QPointF(c.x() + t, c.y())]))
+    p.setBrush(QColor(14, 15, 17, 204))
+    p.drawRoundedRect(b, 4, 4)
+    p.setPen(QColor("#C9CBD1"))
+    p.drawText(b, Qt.AlignCenter, text)
 
 
-class ProjectCard(QWidget):
-    """One project: thumbnail on top, name and 'Edited ...' below. Painted by hand for full control of the look."""
-    activated = Signal(object)            # double-click / Enter
+def paint_warning(p, c, s, col):
+    p.setPen(QPen(QColor(col), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    p.setBrush(Qt.NoBrush)
+    p.drawPolygon(QPolygonF([QPointF(c.x(), c.y() - s / 2), QPointF(c.x() + s / 2, c.y() + s / 2.4),
+                             QPointF(c.x() - s / 2, c.y() + s / 2.4)]))
+    p.drawLine(QPointF(c.x(), c.y() - s / 6), QPointF(c.x(), c.y() + s / 8))
+    p.drawPoint(QPointF(c.x(), c.y() + s / 3.6))
+
+
+def dots_icon(color="#A6A8B0"):
+    pm = QPixmap(48, 48)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(color))
+    for x in (12, 24, 36):
+        p.drawEllipse(QPointF(x, 24), 3.4, 3.4)
+    p.end()
+    return QIcon(pm)
+
+
+class _Tile(QWidget):
+    """Base of a grid tile: hover / pressed state and a cyan ring for keyboard focus only."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hover = self.down = False
+        self.kbd_focus = False
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_Hover, True)
+
+    def card_rect(self):
+        return QRectF(self.rect()).adjusted(RING, RING, -RING, -RING)
+
+    def thumb_rect(self):
+        r = self.card_rect()
+        return QRectF(r.x(), r.y(), r.width(), round(r.width() * 9 / 16))
+
+    def paint_ring(self, p):
+        if self.hasFocus() and self.kbd_focus:
+            p.setPen(QPen(QColor(COL["cyan"]), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 10, 10)
+
+    def enterEvent(self, ev):
+        self.hover = True
+        self.update()
+
+    def leaveEvent(self, ev):
+        self.hover = self.down = False
+        self.update()
+
+    def focusInEvent(self, ev):
+        super().focusInEvent(ev)
+        self.kbd_focus = ev.reason() in (Qt.TabFocusReason, Qt.BacktabFocusReason, Qt.ShortcutFocusReason)
+        self.update()
+
+    def focusOutEvent(self, ev):
+        super().focusOutEvent(ev)
+        self.update()
+
+
+class ProjectCard(_Tile):
+    """One project: picture on top, name, 'Edited 2 hours ago · 0:42 · 9:16', and a ⋯ menu button."""
+    activated = Signal(object)              # click / Enter
     menuRequested = Signal(object, object)  # (card, global pos)
-    navigate = Signal(object, int)         # (card, Qt key) arrow keys
+    navigate = Signal(object, int)          # (card, Qt key)
     renameRequested = Signal(object)
+    renameCommitted = Signal(object, str)
     deleteRequested = Signal(object)
-    focused = Signal(object)
 
     _pix_cache = {}
 
     def __init__(self, info, parent=None):
         super().__init__(parent)
         self.info = info
-        self.hover = False
-        self.selected = False
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setMouseTracking(True)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setAttribute(Qt.WA_Hover, True)
-        tip = info.path if not info.missing else f"{info.path}\n(this file can no longer be found)"
-        self.setToolTip(tip)
+        self.W, self.H, self.length = project_summary(info.path) if not info.missing else (0, 0, 0.0)
+        self.setToolTip(info.path if not info.missing else f"{info.path}\n(this file can no longer be found)")
         self.setAccessibleName(f"Project {info.name}")
+        self.more = QToolButton(self)
+        self.more.setObjectName("cardMenu")
+        self.more.setIcon(dots_icon())
+        self.more.setIconSize(QSize(16, 16))
+        self.more.setFixedSize(24, 24)
+        self.more.setCursor(Qt.PointingHandCursor)
+        self.more.setToolTip("More actions")
+        self.more.setFocusPolicy(Qt.NoFocus)
+        self.more.clicked.connect(lambda: self.menuRequested.emit(
+            self, self.more.mapToGlobal(self.more.rect().bottomLeft())))
+        self.more.hide()
+        self.editor = None
 
-    def thumb_rect(self):
-        w = self.width()
-        return QRectF(0, 0, w, round(w * 9 / 16))
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        r = self.card_rect()
+        self.more.move(int(r.right() - 12 - 24 + 4), int(self.thumb_rect().bottom() + 8))
 
-    def more_rect(self):
-        tr = self.thumb_rect()
-        return QRectF(self.width() - 34, tr.bottom() + 12, 26, 26)
+    def _sync_more(self):
+        self.more.setVisible(self.hover or self.hasFocus())
+
+    def enterEvent(self, ev):
+        super().enterEvent(ev)
+        self._sync_more()
+
+    def leaveEvent(self, ev):
+        super().leaveEvent(ev)
+        self._sync_more()
+
+    def focusInEvent(self, ev):
+        super().focusInEvent(ev)
+        self._sync_more()
+
+    def focusOutEvent(self, ev):
+        super().focusOutEvent(ev)
+        self._sync_more()
 
     def pixmap(self):
         th = self.info.thumbnail
@@ -119,108 +286,130 @@ class ProjectCard(QWidget):
             self._pix_cache[key] = pm
         return None if pm.isNull() else pm
 
+    def meta_text(self):
+        if self.info.missing:
+            return "File not found"
+        parts = [store.relative_time(self.info.modified)]
+        if self.length > 0:
+            parts.append(fmt_dur(self.length))
+        a = aspect_label(self.W, self.H)
+        if a:
+            parts.append(a)
+        if not self.info.managed:
+            parts.append(nice_path(self.info.folder))
+        return "  ·  ".join(x for x in parts if x)
+
     def paintEvent(self, ev):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
-        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        r = self.card_rect()
         outer = QPainterPath()
-        outer.addRoundedRect(r, 8, 8)
-        p.fillPath(outer, QColor(COL["card_hover"] if self.hover else COL["card"]))
+        outer.addRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+        bg = COL["card_down"] if self.down else (COL["card_hover"] if self.hover else COL["card"])
+        p.fillPath(outer, QColor(bg))
         tr = self.thumb_rect()
         p.save()
         p.setClipPath(outer)
-        p.fillRect(tr, QColor(COL["thumb"]))
-        pm = self.pixmap()
-        if pm is not None:
-            sz = pm.size().scaled(tr.size().toSize(), Qt.KeepAspectRatio)
-            dst = QRectF(tr.x() + (tr.width() - sz.width()) / 2, tr.y() + (tr.height() - sz.height()) / 2,
-                         sz.width(), sz.height())
-            if self.info.missing:
-                p.setOpacity(0.35)
-            p.drawPixmap(dst, pm, QRectF(pm.rect()))
-            p.setOpacity(1)
+        if self.info.missing:
+            p.fillRect(tr, QColor("#141518"))
+            c = tr.center()
+            paint_warning(p, QPointF(c.x(), c.y() - 8), 24, COL["warn"])
+            p.setFont(_font(11))
+            p.setPen(QColor(COL["muted"]))
+            p.drawText(QRectF(tr.x(), c.y() + 10, tr.width(), 16), Qt.AlignHCenter | Qt.AlignTop, "File not found")
         else:
-            paint_placeholder(p, tr, self.info.missing)
-        p.setPen(QPen(QColor(COL["edge"]), 1))
-        p.drawLine(QPointF(0, tr.bottom()), QPointF(self.width(), tr.bottom()))
+            pm = self.pixmap()
+            if pm is not None:
+                paint_thumbnail(p, tr, pm, self.W, self.H)
+            else:
+                paint_empty_thumb(p, tr, self.W, self.H)
+            a = aspect_label(self.W, self.H)
+            if a:
+                paint_badge(p, a, tr.left() + 8, tr.bottom() - 8)
+            if self.length > 0:
+                paint_badge(p, fmt_dur(self.length), tr.right() - 8, tr.bottom() - 8, right=True)
+            if self.info.has_recovery:
+                p.setFont(_font(10, QFont.DemiBold))
+                txt = "Recovered changes"
+                bw = QFontMetrics(_font(10, QFont.DemiBold)).horizontalAdvance(txt) + 14
+                b = QRectF(tr.left() + 8, tr.top() + 8, bw, 18)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor("#3A2E12"))
+                p.drawRoundedRect(b, 4, 4)
+                p.setPen(QColor("#F5C060"))
+                p.drawText(b, Qt.AlignCenter, txt)
         p.restore()
 
-        if self.info.has_recovery and not self.info.missing:
-            f = _font(10, QFont.DemiBold)
-            p.setFont(f)
-            txt = "Recovered changes"
-            bw = QFontMetrics(f).horizontalAdvance(txt) + 16
-            b = QRectF(10, 10, bw, 20)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(COL["badge_bg"]))
-            p.drawRoundedRect(b, 10, 10)
-            p.setPen(QColor(COL["badge_fg"]))
-            p.drawText(b, Qt.AlignCenter, txt)
-
-        x, y0 = 14, tr.bottom() + 11
-        textw = self.width() - x - 40
+        x, textw = r.x() + 12, r.width() - 24 - 28
         f = _font(13, QFont.DemiBold)
         p.setFont(f)
-        p.setPen(QColor(COL["dim"] if self.info.missing else COL["text"]))
-        p.drawText(QRectF(x, y0, textw, 18), Qt.AlignLeft | Qt.AlignVCenter,
-                   QFontMetrics(f).elidedText(self.info.name, Qt.ElideRight, int(textw)))
+        p.setPen(QColor(COL["muted"] if self.info.missing else COL["text"]))
+        if self.editor is None:
+            p.drawText(QRectF(x, tr.bottom() + 10, textw, 20), Qt.AlignLeft | Qt.AlignVCenter,
+                       QFontMetrics(f).elidedText(self.info.name, Qt.ElideRight, int(textw)))
         f2 = _font(11)
         p.setFont(f2)
-        if self.info.missing:
-            p.setPen(QColor(COL["bad"]))
-            sub = "File not found"
-        else:
-            p.setPen(QColor(COL["sub"]))
-            sub = store.relative_time(self.info.modified)
-            if not self.info.managed:
-                sub += "  ·  " + nice_path(self.info.folder)
-        p.drawText(QRectF(x, y0 + 20, textw, 16), Qt.AlignLeft | Qt.AlignVCenter,
-                   QFontMetrics(f2).elidedText(sub, Qt.ElideMiddle, int(textw)))
-
-        if self.hover or self.selected:
-            mr = self.more_rect()
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(COL["sub"]))
-            for i in (-5, 0, 5):
-                p.drawEllipse(QPointF(mr.center().x() + i, mr.center().y()), 1.6, 1.6)
-
-        if self.selected or self.hasFocus():
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(COL["sel"]), 2))
-            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 8, 8)
-        else:
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(COL["edge_hover"] if self.hover else COL["edge"]), 1))
-            p.drawPath(outer)
+        p.setPen(QColor(COL["sub"]))
+        p.drawText(QRectF(x, tr.bottom() + 34, r.width() - 24, 16), Qt.AlignLeft | Qt.AlignVCenter,
+                   QFontMetrics(f2).elidedText(self.meta_text(), Qt.ElideMiddle, int(r.width() - 24)))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(COL["edge_hover"] if self.hover else COL["edge"]), 1))
+        p.drawPath(outer)
+        self.paint_ring(p)
         p.end()
 
-    def enterEvent(self, ev):
-        self.hover = True
+    # ---- inline rename
+    def start_rename(self):
+        if self.info.missing or self.editor is not None:
+            return
+        tr = self.thumb_rect()
+        e = QLineEdit(self.info.name, self)
+        e.setObjectName("cardNameEdit")
+        e.setGeometry(int(self.card_rect().x() + 8), int(tr.bottom() + 8), int(self.card_rect().width() - 16), 24)
+        e.selectAll()
+        e.show()
+        e.setFocus(Qt.OtherFocusReason)
+        self.editor = e
+        e.returnPressed.connect(lambda: self.end_rename(True))
+        e.installEventFilter(self)
         self.update()
 
-    def leaveEvent(self, ev):
-        self.hover = False
+    def end_rename(self, commit):
+        e = self.editor
+        if e is None:
+            return
+        self.editor = None
+        text = e.text().strip()
+        e.hide()
+        e.deleteLater()
+        self.setFocus(Qt.OtherFocusReason)
         self.update()
+        if commit and text and text != self.info.name:
+            self.renameCommitted.emit(self, text)
 
-    def focusInEvent(self, ev):
-        super().focusInEvent(ev)
-        self.focused.emit(self)
-        self.update()
+    def eventFilter(self, obj, ev):
+        if obj is self.editor:
+            if ev.type() == ev.Type.KeyPress and ev.key() == Qt.Key_Escape:
+                self.end_rename(False)
+                return True
+            if ev.type() == ev.Type.FocusOut:
+                QTimer.singleShot(0, lambda: self.end_rename(False))
+        return super().eventFilter(obj, ev)
 
-    def focusOutEvent(self, ev):
-        super().focusOutEvent(ev)
-        self.update()
-
+    # ---- input
     def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.down = True
+            self.update()
         self.setFocus(Qt.MouseFocusReason)
-        if ev.button() == Qt.LeftButton and (self.hover or self.selected) and \
-                self.more_rect().adjusted(-4, -4, 4, 4).contains(ev.position()):
-            self.menuRequested.emit(self, self.mapToGlobal(self.more_rect().bottomLeft().toPoint()))
 
-    def mouseDoubleClickEvent(self, ev):
-        if ev.button() == Qt.LeftButton and not self.more_rect().contains(ev.position()):
-            self.activated.emit(self)
+    def mouseReleaseEvent(self, ev):
+        was = self.down
+        self.down = False
+        self.update()
+        if ev.button() == Qt.LeftButton and was and self.rect().contains(ev.position().toPoint()):
+            self.activated.emit(self)            # a single click opens (like Clipchamp / CapCut)
 
     def contextMenuEvent(self, ev):
         self.setFocus(Qt.MouseFocusReason)
@@ -228,11 +417,11 @@ class ProjectCard(QWidget):
 
     def keyPressEvent(self, ev):
         k = ev.key()
-        if k in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+        if k in (Qt.Key_Return, Qt.Key_Enter):
             self.activated.emit(self)
         elif k == Qt.Key_F2:
             self.renameRequested.emit(self)
-        elif k in (Qt.Key_Delete, Qt.Key_Backspace):
+        elif k == Qt.Key_Delete:
             self.deleteRequested.emit(self)
         elif k in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End):
             self.navigate.emit(self, k)
@@ -242,78 +431,64 @@ class ProjectCard(QWidget):
             super().keyPressEvent(ev)
 
 
-class NewCard(QWidget):
+class NewCard(_Tile):
     """The 'New project' tile that starts the grid."""
     clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.hover = False
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setCursor(Qt.PointingHandCursor)
         self.setToolTip("Start a new video project  (Ctrl+N)")
         self.setAccessibleName("New project")
+        self.canvas_text = "Vertical 9:16 · change it any time"
 
     def paintEvent(self, ev):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        p.setBrush(QColor("#1C1D21" if not self.hover else "#212227"))
-        if self.hasFocus():
-            pen = QPen(QColor(COL["sel"]), 2)
+        r = self.card_rect().adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setBrush(QColor("#17181B"))
+        if self.hover:
+            pen = QPen(QColor(COL["blue"]), 1)
         else:
-            pen = QPen(QColor("#4A4B53" if self.hover else "#34353B"), 1.2)
+            pen = QPen(QColor("#3A3B42"), 1, Qt.CustomDashLine)
             pen.setDashPattern([4, 3])
         p.setPen(pen)
         p.drawRoundedRect(r, 8, 8)
-        tr = QRectF(0, 0, self.width(), round(self.width() * 9 / 16))
-        c = tr.center()
+        tr = self.thumb_rect()
+        c = QPointF(tr.center().x(), tr.center().y() + 6)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#3A78E0" if self.hover or self.hasFocus() else "#2A2B30"))
-        p.drawEllipse(c, 22, 22)
-        p.setPen(QPen(QColor("#FFFFFF" if self.hover or self.hasFocus() else "#C9CBD1"), 2, Qt.SolidLine, Qt.RoundCap))
-        p.drawLine(QPointF(c.x() - 8, c.y()), QPointF(c.x() + 8, c.y()))
-        p.drawLine(QPointF(c.x(), c.y() - 8), QPointF(c.x(), c.y() + 8))
+        p.setBrush(QColor(COL["blue_hover"] if self.hover else COL["blue"]))
+        p.drawEllipse(c, 20, 20)
+        p.setPen(QPen(QColor("#FFFFFF"), 2, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(c.x() - 7, c.y()), QPointF(c.x() + 7, c.y()))
+        p.drawLine(QPointF(c.x(), c.y() - 7), QPointF(c.x(), c.y() + 7))
         p.setFont(_font(13, QFont.DemiBold))
         p.setPen(QColor(COL["text"]))
-        p.drawText(QRectF(14, tr.bottom() + 11, self.width() - 28, 18), Qt.AlignLeft | Qt.AlignVCenter, "New project")
+        p.drawText(QRectF(r.x(), tr.bottom() + 10, r.width(), 20), Qt.AlignHCenter | Qt.AlignVCenter, "New project")
         p.setFont(_font(11))
         p.setPen(QColor(COL["sub"]))
-        p.drawText(QRectF(14, tr.bottom() + 31, self.width() - 28, 16), Qt.AlignLeft | Qt.AlignVCenter,
-                   "Start from a blank timeline")
+        p.drawText(QRectF(r.x() + 8, tr.bottom() + 34, r.width() - 16, 16), Qt.AlignHCenter | Qt.AlignVCenter,
+                   QFontMetrics(_font(11)).elidedText(self.canvas_text, Qt.ElideRight, int(r.width() - 16)))
+        self.paint_ring(p)
         p.end()
 
-    def enterEvent(self, ev):
-        self.hover = True
-        self.update()
-
-    def leaveEvent(self, ev):
-        self.hover = False
-        self.update()
-
-    def focusInEvent(self, ev):
-        super().focusInEvent(ev)
-        self.update()
-
-    def focusOutEvent(self, ev):
-        super().focusOutEvent(ev)
-        self.update()
+    def mousePressEvent(self, ev):
+        self.setFocus(Qt.MouseFocusReason)
 
     def mouseReleaseEvent(self, ev):
         if ev.button() == Qt.LeftButton and self.rect().contains(ev.position().toPoint()):
             self.clicked.emit()
 
     def keyPressEvent(self, ev):
-        if ev.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+        if ev.key() in (Qt.Key_Return, Qt.Key_Enter):
             self.clicked.emit()
-        elif ev.key() in (Qt.Key_Right, Qt.Key_Down) and self.parent() is not None:
+        elif ev.key() in (Qt.Key_Right, Qt.Key_Down) and isinstance(self.parent(), ProjectGrid):
             self.parent().focus_index(0)
         else:
             super().keyPressEvent(ev)
 
 
 class ProjectGrid(QWidget):
-    """Lays the cards out in as many columns as fit (responsive); height follows the content."""
+    """Lays the tiles out in as many columns as fit (responsive); its height follows the content."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -336,20 +511,20 @@ class ProjectGrid(QWidget):
         return [self.new_card] + self.cards
 
     def relayout(self):
-        avail = max(CARD_MIN, self.width())
-        cols = max(1, (avail + GAP) // (CARD_MIN + GAP))
-        w = min(CARD_MAX, (avail - GAP * (cols - 1)) / cols)
-        if w >= CARD_MAX:          # wide window: more columns of the largest size instead of huge cards
-            cols = max(1, (avail + GAP) // (CARD_MAX + GAP))
-            w = min(CARD_MAX, (avail - GAP * (cols - 1)) / cols)
+        avail = max(CARD_LO, self.width() - 2 * RING)
+        cols = max(2, (avail + GAP_X) // (CARD_MIN + GAP_X))
+        cw = (avail - GAP_X * (cols - 1)) / cols
+        if cw < CARD_LO:
+            cols = max(1, (avail + GAP_X) // (CARD_LO + GAP_X))
+            cw = (avail - GAP_X * (cols - 1)) / cols
+        cw = int(min(CARD_MAX, cw))
         self.cols = cols
-        w = int(w)
-        h = round(w * 9 / 16) + TEXT_H
+        ch = round(cw * 9 / 16) + META_H
         for i, c in enumerate(self.tiles()):
             r, k = divmod(i, cols)
-            c.setGeometry(int(k * (w + GAP)), int(r * (h + GAP)), w, h)
+            c.setGeometry(int(k * (cw + GAP_X)), int(r * (ch + GAP_Y)), cw + 2 * RING, ch + 2 * RING)
         rows = (len(self.tiles()) + cols - 1) // cols
-        self.setFixedHeight(rows * h + (rows - 1) * GAP + 4)
+        self.setFixedHeight(rows * ch + (rows - 1) * GAP_Y + 2 * RING)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
@@ -357,12 +532,10 @@ class ProjectGrid(QWidget):
 
     def focus_index(self, i):
         if self.cards:
-            i = max(0, min(len(self.cards) - 1, i))
-            self.cards[i].setFocus(Qt.TabFocusReason)
+            self.cards[max(0, min(len(self.cards) - 1, i))].setFocus(Qt.TabFocusReason)
 
     def move_from(self, card, key):
-        i = self.cards.index(card)
-        pos = i + 1                                   # index among tiles (the New tile is 0)
+        pos = self.cards.index(card) + 1                   # index among tiles (the New tile is 0)
         step = {Qt.Key_Left: -1, Qt.Key_Right: 1, Qt.Key_Up: -self.cols, Qt.Key_Down: self.cols}.get(key)
         if key == Qt.Key_Home:
             self.focus_index(0)
@@ -370,150 +543,163 @@ class ProjectGrid(QWidget):
             self.focus_index(len(self.cards) - 1)
         elif step:
             j = pos + step
-            if j <= 0:
+            if j <= 0 and pos + step > -self.cols:
                 self.new_card.setFocus(Qt.TabFocusReason)
-            elif j <= len(self.cards):
+            elif 1 <= j <= len(self.cards):
                 self.focus_index(j - 1)
 
 
 class Dashboard(QWidget):
-    openRequested = Signal(str)          # open this .clipproj
-    newRequested = Signal(str)           # create a project with this name and open it
+    openRequested = Signal(str)            # open this .clipproj
+    newRequested = Signal(str)             # create a project with this name, open it and start renaming it
+    restoreRequested = Signal(str)         # open this project and restore its recovered changes
     projectsDirChanged = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, brand=None, icon=None, dialogs=None):
+        """brand: the logo widget for the header; icon(name, colour) -> QIcon; dialogs: module with QMessageBox,
+        QFileDialog, QInputDialog and QMenu (the app's own, so they can be swapped in one place)."""
         super().__init__(parent)
         self.setObjectName("dashboard")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.dlg = dialogs or QtWidgets
+        self.icon = icon or (lambda name, color="#C9CBD1": QIcon())
         self.selected_path = None
+        self.infos = []
+        self.recover_path = None
 
-        # top bar: same height, colours and wordmark as the editor header
+        # header: same height, margins and logo as the editor's, so switching pages doesn't shift anything
         bar = QWidget()
         bar.setObjectName("header")
         bar.setFixedHeight(44)
         hb = QHBoxLayout(bar)
         hb.setContentsMargins(12, 6, 12, 6)
         hb.setSpacing(8)
-        mark = QLabel("Parrot Studio")
-        mark.setObjectName("title")
-        hb.addWidget(mark)
+        if brand is None:
+            brand = QLabel(store.APP_NAME)
+            brand.setObjectName("title")
+        hb.addWidget(brand)
         hb.addStretch(1)
-        self.b_open = QPushButton("Open other…")
-        self.b_open.setObjectName("ghost")
-        self.b_open.setToolTip("Browse for a .clipproj file anywhere on your computer  (Ctrl+O)")
-        self.b_open.setCursor(Qt.PointingHandCursor)
-        self.b_open.clicked.connect(self.open_existing)
+        self.b_open = self._button("Open project…", "ghost", "Find a .clipproj file anywhere on your computer  (Ctrl+O)",
+                                   self.open_existing, "folder", "#C9CBD1")
         hb.addWidget(self.b_open)
-        self.b_new = QPushButton("New project")
-        self.b_new.setObjectName("primary")
-        self.b_new.setToolTip("Start a new video project  (Ctrl+N)")
-        self.b_new.setCursor(Qt.PointingHandCursor)
-        self.b_new.clicked.connect(self.new_project)
+        self.b_new = self._button("New project", "primary", "Start a new video project  (Ctrl+N)", self.new_project,
+                                  "plus", "#FFFFFF")
         hb.addWidget(self.b_new)
         self.top_bar = bar
 
-        # body
-        body = QWidget()
-        body.setObjectName("dashBody")
-        bl = QVBoxLayout(body)
-        bl.setContentsMargins(40, 28, 40, 32)
-        bl.setSpacing(0)
+        # page content, at most CONTENT_MAX wide and centred
+        content = QWidget()
+        content.setObjectName("dashContent")
+        content.setMaximumWidth(CONTENT_MAX)
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(32, 32, 32, 32)
+        cl.setSpacing(0)
+        self.content_layout = cl
+        tr = QHBoxLayout()
         title = QLabel("Your projects")
-        title.setObjectName("dashTitle")
-        bl.addWidget(title)
-        bl.addSpacing(6)
-        pr = QHBoxLayout()
-        pr.setSpacing(6)
-        lab = QLabel("Projects folder")
-        lab.setObjectName("dashMeta")
-        pr.addWidget(lab)
+        title.setObjectName("pageTitle")
+        tr.addWidget(title, 0, Qt.AlignBottom)
+        tr.addStretch(1)
+        self.lbl_count = QLabel("")
+        self.lbl_count.setObjectName("hint")
+        tr.addWidget(self.lbl_count, 0, Qt.AlignBottom)
+        cl.addLayout(tr)
+        cl.addSpacing(8)
+        loc = QHBoxLayout()
+        loc.setSpacing(0)
+        fi = QLabel()
+        fi.setPixmap(self.icon("folder", "#767880").pixmap(16, 16))
+        loc.addWidget(fi)
+        loc.addSpacing(6)
         self.lbl_dir = QLabel()
-        self.lbl_dir.setObjectName("dashPath")
-        self.lbl_dir.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        pr.addWidget(self.lbl_dir)
-        self.b_dir = QPushButton("Change…")
-        self.b_dir.setObjectName("link")
-        self.b_dir.setToolTip("Choose where new projects are created")
-        self.b_dir.setCursor(Qt.PointingHandCursor)
-        self.b_dir.clicked.connect(self.change_projects_dir)
-        pr.addWidget(self.b_dir)
-        self.b_show_dir = QPushButton("Show")
-        self.b_show_dir.setObjectName("link")
-        self.b_show_dir.setToolTip("Open the projects folder in your file manager")
-        self.b_show_dir.setCursor(Qt.PointingHandCursor)
-        self.b_show_dir.clicked.connect(lambda: reveal_in_file_manager(self.projects_dir()))
-        pr.addWidget(self.b_show_dir)
-        pr.addStretch(1)
-        bl.addLayout(pr)
-        bl.addSpacing(18)
+        self.lbl_dir.setObjectName("projPath")
+        self.lbl_dir.setMinimumWidth(60)
+        loc.addWidget(self.lbl_dir, 0)
+        loc.addSpacing(12)
+        self.b_dir = self._button("Change…", "ghost", "Choose where new projects are kept", self.change_projects_dir)
+        loc.addWidget(self.b_dir)
+        self.b_show_dir = self._button("Open folder", "ghost", "Show the projects folder in your file manager",
+                                       lambda: reveal_in_file_manager(self.projects_dir()))
+        loc.addWidget(self.b_show_dir)
+        loc.addStretch(1)
+        cl.addLayout(loc)
+        cl.addSpacing(24)
 
+        # recovery banner
         self.banner = QFrame()
         self.banner.setObjectName("recoveryBanner")
+        self.banner.setFixedHeight(44)
         rb = QHBoxLayout(self.banner)
-        rb.setContentsMargins(14, 8, 8, 8)
+        rb.setContentsMargins(12, 0, 8, 0)
+        rb.setSpacing(8)
+        wi = QLabel()
+        wi.setPixmap(self.icon("warn", COL["warn"]).pixmap(16, 16))
+        rb.addWidget(wi)
         self.banner_text = QLabel()
         self.banner_text.setObjectName("bannerText")
-        self.banner_text.setWordWrap(True)
         rb.addWidget(self.banner_text, 1)
-        self.banner_btn = QPushButton("Open and review")
-        self.banner_btn.setCursor(Qt.PointingHandCursor)
-        self.banner_btn.clicked.connect(self._open_banner_project)
-        rb.addWidget(self.banner_btn)
-        wrap = QWidget()
-        wl = QVBoxLayout(wrap)
-        wl.setContentsMargins(0, 0, 0, 18)
-        wl.addWidget(self.banner)
-        self.banner_wrap = wrap
-        wrap.hide()
-        bl.addWidget(wrap)
+        self.banner_discard = self._button("Discard", "ghost", "Throw the recovered changes away", self.discard_banner)
+        rb.addWidget(self.banner_discard)
+        self.banner_restore = self._button("Restore", "primary", "Open the project with the recovered changes",
+                                           self.restore_banner)
+        rb.addWidget(self.banner_restore)
+        self.banner_wrap = QWidget()
+        bw = QVBoxLayout(self.banner_wrap)
+        bw.setContentsMargins(0, 0, 0, 20)
+        bw.addWidget(self.banner)
+        self.banner_wrap.hide()
+        cl.addWidget(self.banner_wrap)
 
         self.grid = ProjectGrid()
         self.grid.new_card.clicked.connect(self.new_project)
-        bl.addWidget(self.grid)
+        cl.addWidget(self.grid)
 
+        # empty state
         self.empty = QWidget()
         self.empty.setObjectName("emptyState")
         el = QVBoxLayout(self.empty)
-        el.setContentsMargins(0, 48, 0, 0)
-        el.setSpacing(10)
-        el.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        el.setContentsMargins(0, 24, 0, 0)
+        el.setSpacing(8)
+        el.addStretch(1)
         art = QLabel()
         art.setPixmap(self._empty_art())
         art.setAlignment(Qt.AlignHCenter)
         el.addWidget(art)
-        e1 = QLabel("No projects yet")
+        el.addSpacing(16)
+        e1 = QLabel("Start your first video")
         e1.setObjectName("emptyTitle")
         e1.setAlignment(Qt.AlignHCenter)
         el.addWidget(e1)
-        e2 = QLabel("Create a project to start editing. Your work is saved automatically as you go.")
-        e2.setObjectName("hint")
+        e2 = QLabel("Projects are saved automatically in your projects folder.")
+        e2.setObjectName("emptyBody")
         e2.setAlignment(Qt.AlignHCenter)
-        el.addWidget(e2)
-        el.addSpacing(8)
-        er = QHBoxLayout()
-        er.setSpacing(8)
-        er.addStretch(1)
-        b1 = QPushButton("New project")
-        b1.setObjectName("primary")
-        b1.setCursor(Qt.PointingHandCursor)
-        b1.clicked.connect(self.new_project)
-        b1.setMinimumWidth(120)
-        er.addWidget(b1)
-        b2 = QPushButton("Open other…")
-        b2.setCursor(Qt.PointingHandCursor)
-        b2.clicked.connect(self.open_existing)
-        er.addWidget(b2)
-        er.addStretch(1)
-        el.addLayout(er)
-        self.empty_new = b1
-        bl.addWidget(self.empty)
-        bl.addStretch(1)
+        e2.setWordWrap(False)
+        el.addWidget(e2, 0, Qt.AlignHCenter)
+        el.addSpacing(16)
+        self.empty_new = self._button("New project", "primary", "Start a new video project  (Ctrl+N)",
+                                      self.new_project, "plus", "#FFFFFF")
+        self.empty_new.setObjectName("primaryLarge")
+        self.empty_new.setMinimumWidth(160)
+        el.addWidget(self.empty_new, 0, Qt.AlignHCenter)
+        self.empty_open = self._button("Open project…", "ghost", "Find a .clipproj file anywhere on your computer",
+                                       self.open_existing)
+        el.addWidget(self.empty_open, 0, Qt.AlignHCenter)
+        el.addStretch(2)
+        cl.addWidget(self.empty, 1)
+        cl.addStretch(0)
 
+        holder = QWidget()
+        holder.setObjectName("dashBody")
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(content, 1)
+        self.content = content
         sa = QScrollArea()
         sa.setObjectName("dashScroll")
         sa.setWidgetResizable(True)
         sa.setFrameShape(QFrame.NoFrame)
         sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        sa.setWidget(body)
+        sa.setWidget(holder)
         self.scroll = sa
 
         v = QVBoxLayout(self)
@@ -521,39 +707,52 @@ class Dashboard(QWidget):
         v.setSpacing(0)
         v.addWidget(bar)
         v.addWidget(sa, 1)
-        self.infos = []
         self.refresh()
 
-    # ------------------------------------------------------------------ dialogs (replaceable in tests)
+    def _button(self, text, name, tip, fn, icon=None, color="#C9CBD1"):
+        b = QPushButton(text)
+        b.setObjectName(name)
+        b.setToolTip(tip)
+        b.setCursor(Qt.PointingHandCursor)
+        b.clicked.connect(lambda *_: fn())
+        if icon:
+            b.setIcon(self.icon(icon, color))
+            b.setIconSize(QSize(16, 16))
+        return b
+
+    # ------------------------------------------------------------------ dialogs
     def ask_text(self, title, label, text=""):
-        t, ok = QInputDialog.getText(self, title, label, QLineEdit.Normal, text)
-        return t.strip() if ok and t.strip() else None
+        t, ok = self.dlg.QInputDialog.getText(self, title, label, QLineEdit.Normal, text)
+        return t.strip() if ok and t and t.strip() else None
 
     def confirm(self, title, text, info="", ok_text="OK", danger=False):
-        m = QMessageBox(self)
-        m.setIcon(QMessageBox.Warning if danger else QMessageBox.Question)
+        MB = self.dlg.QMessageBox
+        m = MB(self)
+        m.setIcon(MB.Warning if danger else MB.Question)
         m.setWindowTitle(title)
         m.setText(text)
         if info:
             m.setInformativeText(info)
-        ok = m.addButton(ok_text, QMessageBox.AcceptRole)
+        ok = m.addButton(ok_text, MB.AcceptRole)
         if danger:
             ok.setObjectName("danger")
-        cancel = m.addButton("Cancel", QMessageBox.RejectRole)
+            ok.style().unpolish(ok)
+            ok.style().polish(ok)
+        cancel = m.addButton("Cancel", MB.RejectRole)
         m.setDefaultButton(cancel if danger else ok)
         m.exec()
         return m.clickedButton() is ok
 
     def warn(self, title, text):
-        QMessageBox.warning(self, title, text)
+        self.dlg.QMessageBox.warning(self, title, text)
 
     def pick_file(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Open a project", self.projects_dir(),
-                                           "Parrot Studio project (*.clipproj)")
+        p, _ = self.dlg.QFileDialog.getOpenFileName(self, "Open project", self.projects_dir(),
+                                                    "Parrot Studio project (*.clipproj)")
         return p or None
 
     def pick_dir(self):
-        p = QFileDialog.getExistingDirectory(self, "Choose the projects folder", self.projects_dir())
+        p = self.dlg.QFileDialog.getExistingDirectory(self, "Choose the projects folder", self.projects_dir())
         return p or None
 
     # ------------------------------------------------------------------ data
@@ -562,8 +761,7 @@ class Dashboard(QWidget):
 
     def refresh(self):
         """Re-read the projects from disk and rebuild the cards (keeps the selection)."""
-        self.lbl_dir.setText(nice_path(self.projects_dir()))
-        self.lbl_dir.setToolTip(self.projects_dir())
+        self._elide_dir()
         try:
             self.infos = store.list_projects()
         except Exception as e:                       # listing must never take the home screen down
@@ -575,24 +773,33 @@ class Dashboard(QWidget):
             c.activated.connect(lambda card: self.open_card(card.info))
             c.menuRequested.connect(self.card_menu)
             c.navigate.connect(self.grid.move_from)
-            c.renameRequested.connect(lambda card: self.rename(card.info))
+            c.renameRequested.connect(lambda card: card.start_rename())
+            c.renameCommitted.connect(lambda card, name: self.rename(card.info, name))
             c.deleteRequested.connect(lambda card: self.delete(card.info))
-            c.focused.connect(self._select_card)
-            c.selected = info.path == self.selected_path
             cards.append(c)
         self.grid.set_cards(cards)
         has = bool(self.infos)
         self.grid.setVisible(has)
         self.empty.setVisible(not has)
-        rec = [i for i in self.infos if i.has_recovery and not i.missing]
+        n = len([i for i in self.infos if not i.missing])
+        self.lbl_count.setText(f"{n} project{'s' if n != 1 else ''}" if has else "")
+        rec = next((i for i in self.infos if i.has_recovery and not i.missing), None)
+        self.recover_path = rec.path if rec else None
         if rec:
-            names = ", ".join(f"“{i.name}”" for i in rec[:3]) + (" and others" if len(rec) > 3 else "")
-            self.banner_text.setText(f"Unsaved changes were recovered for {names}. Open the project to restore or "
-                                     "discard them.")
-            self.banner_path = rec[0].path
-            self.banner_wrap.show()
-        else:
-            self.banner_wrap.hide()
+            info = None
+            try:
+                info = store.find_recovery(rec.path)
+            except Exception as e:
+                store.report_problem(f"Could not read the recovered changes of {rec.path}", e)
+            when = ""
+            if info is not None:
+                import time
+                when = " from " + time.strftime("%H:%M" if time.time() - info.saved_at < 86400 else "%d %b %H:%M",
+                                                time.localtime(info.saved_at)).lstrip("0")
+            self.banner_text.setText(f"“{rec.name}” wasn't closed properly. Recovered changes{when} are "
+                                     "available.")
+            self.banner_text.setToolTip(rec.path)
+        self.banner_wrap.setVisible(rec is not None)
 
     def cards(self):
         return list(self.grid.cards)
@@ -600,54 +807,55 @@ class Dashboard(QWidget):
     def card_for(self, path):
         return next((c for c in self.grid.cards if os.path.normcase(c.info.path) == os.path.normcase(path)), None)
 
-    def _select_card(self, card):
-        self.selected_path = card.info.path
-        for c in self.grid.cards:
-            if c.selected != (c is card):
-                c.selected = c is card
-                c.update()
-
     def focus_first(self):
-        if self.grid.cards:
-            c = self.card_for(self.selected_path) if self.selected_path else None
-            (c or self.grid.cards[0]).setFocus(Qt.OtherFocusReason)
-        elif self.empty.isVisible():
-            self.empty_new.setFocus(Qt.OtherFocusReason)
+        """Give the keyboard a sensible start without arming a button (Space must never create a project)."""
+        c = self.card_for(self.selected_path) if self.selected_path else None
+        if c is None and self.grid.cards:
+            c = self.grid.cards[0]
+        if c is not None:
+            c.setFocus(Qt.OtherFocusReason)
+        else:
+            self.scroll.setFocus(Qt.OtherFocusReason)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        m = 24 if self.width() < 1100 else 32
+        self.content_layout.setContentsMargins(m, 32, m, 32)
+        self._elide_dir()
+
+    def _elide_dir(self):
+        d = self.projects_dir()
+        avail = max(80, min(self.content.width(), CONTENT_MAX) - 64 - 16 - 6 - 12 - 200)
+        self.lbl_dir.setText(self.lbl_dir.fontMetrics().elidedText(d, Qt.ElideMiddle, avail))
+        self.lbl_dir.setToolTip(d)
 
     def _empty_art(self):
         dpr = 2
-        pm = QPixmap(QSize(150 * dpr, 96 * dpr))
+        pm = QPixmap(QSize(56 * dpr, 56 * dpr))
         pm.setDevicePixelRatio(dpr)
         pm.fill(Qt.transparent)
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing)
-        for i, (x, y, a) in enumerate([(18, 18, 90), (34, 8, 255)]):
-            r = QRectF(x, y, 98, 66)
-            p.setPen(QPen(QColor("#34353B"), 1))
-            p.setBrush(QColor("#1F2024"))
-            p.drawRoundedRect(r, 8, 8)
-            if i == 1:
-                p.save()
-                path = QPainterPath()
-                path.addRoundedRect(r.adjusted(1, 1, -1, -1), 7, 7)
-                p.setClipPath(path)
-                paint_placeholder(p, r)
-                p.restore()
+        p.setPen(QPen(QColor("#3A3B42"), 1.5))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(1, 1, 54, 54), 14, 14)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(127, 229, 255, 102))
+        p.drawPolygon(QPolygonF([QPointF(21, 16), QPointF(39, 26.5), QPointF(34, 33.5), QPointF(31.5, 30.5),
+                                 QPointF(21, 40)]))
         p.end()
         return pm
 
     # ------------------------------------------------------------------ actions
-    def new_project(self):
-        name = self.ask_text("New project", "Name your project:", self.suggest_name())
-        if name:
-            self.newRequested.emit(name)
-
-    def suggest_name(self):
-        base = "My video"
+    def suggest_name(self, base="Untitled video"):
         try:
             return store.unique_name(self.projects_dir(), base)
         except Exception:
             return base
+
+    def new_project(self):
+        """Create straight away with a default name; the editor then lets the user type a better one."""
+        self.newRequested.emit(self.suggest_name())
 
     def open_existing(self):
         p = self.pick_file()
@@ -656,78 +864,109 @@ class Dashboard(QWidget):
 
     def open_card(self, info):
         if info.missing or not os.path.isfile(info.path):
-            if self.confirm("Project not found", f"“{info.name}” can no longer be found at\n{info.path}",
-                            "It may have been moved, renamed or deleted. Remove it from this list?",
-                            "Remove from list"):
-                store.remove_recent(info.path)
-                self.refresh()
+            self.locate(info)
             return
+        self.selected_path = info.path
         self.openRequested.emit(info.path)
 
-    def _open_banner_project(self):
-        p = getattr(self, "banner_path", None)
-        if p:
-            self.openRequested.emit(p)
+    def locate(self, info):
+        p = self.pick_file()
+        if not p:
+            return
+        store.remove_recent(info.path)
+        store.add_recent(p)
+        self.refresh()
+
+    def restore_banner(self):
+        if self.recover_path:
+            self.restoreRequested.emit(self.recover_path)
+
+    def discard_banner(self):
+        p = self.recover_path
+        if not p:
+            return
+        if not self.confirm("Discard recovered changes?", f"Throw away the recovered changes of "
+                            f"“{store.project_name(p)}”?", "The last saved version of the project is kept.",
+                            "Discard", danger=True):
+            return
+        try:
+            while True:
+                info = store.find_recovery(p)
+                if info is None:
+                    break
+                store.discard_recovery(p, info)
+        except Exception as e:
+            store.report_problem(f"Could not discard the recovered changes of {p}", e)
+        self.refresh()
 
     def card_menu(self, card, gpos):
         info = card.info
-        m = QMenu(self)
+        m = self.dlg.QMenu(self)
         if info.missing:
+            m.addAction("Locate…", lambda: self.locate(info))
             m.addAction("Remove from list", lambda: self.forget(info))
         else:
             m.addAction("Open", lambda: self.open_card(info))
-            m.addAction("Rename…\tF2", lambda: self.rename(info))
+            a = m.addAction("Rename…", card.start_rename)
+            a.setShortcut("F2")
+            a.setShortcutContext(Qt.WidgetShortcut)
+            a.setShortcutVisibleInContextMenu(True)
             m.addAction("Show in folder", lambda: reveal_in_file_manager(info.path))
             m.addSeparator()
             if not info.managed:
                 m.addAction("Remove from list", lambda: self.forget(info))
-            m.addAction("Delete…\tDel", lambda: self.delete(info))
+            d = m.addAction(self.icon("trash", "#F07A7E"), "Delete…", lambda: self.delete(info))
+            d.setShortcut("Del")
+            d.setShortcutContext(Qt.WidgetShortcut)
+            d.setShortcutVisibleInContextMenu(True)
         m.exec(gpos)
+        m.deleteLater()
 
     def forget(self, info):
         store.remove_recent(info.path)
         self.refresh()
 
-    def rename(self, info):
+    def rename(self, info, name=None):
         if info.missing:
-            return
-        name = self.ask_text("Rename project", "New name:", info.name)
+            return None
+        if name is None:
+            name = self.ask_text("Rename project", "New name:", info.name)
         if not name or name == info.name:
-            return
+            return None
         try:
             new = store.rename_project(info.path, name)
         except store.ProjectError as e:
             self.warn("Could not rename", str(e))
-            return
+            return None
         self.selected_path = new
         self.refresh()
         c = self.card_for(new)
         if c:
             c.setFocus(Qt.OtherFocusReason)
+        return new
 
     def delete(self, info):
         if info.missing:
             self.forget(info)
-            return
-        what = ("the project folder" if info.managed else "the project file")
-        if not self.confirm("Delete project", f"Delete “{info.name}”?",
-                            f"This permanently deletes {what}. The video, audio and picture files you imported "
-                            "are not touched.", "Delete", danger=True):
-            return
+            return False
+        if not self.confirm("Delete project?", f"“{info.name}” will be deleted permanently.",
+                            "Your imported media files are not deleted.", "Delete", danger=True):
+            return False
         idx = next((i for i, c in enumerate(self.grid.cards) if c.info.path == info.path), 0)
         try:
             left = store.delete_project(info.path)
         except store.ProjectError as e:
             self.warn("Could not delete", str(e))
             self.refresh()
-            return
+            return False
         if left:
-            self.warn("Project deleted", "The project was deleted. Some files you added to its folder were kept:\n\n"
-                      + "\n".join(os.path.basename(x) for x in left[:10]))
+            self.warn("Project deleted", "The project was deleted. Files you added to its folder yourself were "
+                      "kept:\n\n" + "\n".join(os.path.basename(x) for x in left[:10]))
         self.selected_path = None
         self.refresh()
         if self.grid.cards:
             self.grid.focus_index(min(idx, len(self.grid.cards) - 1))
+        return True
 
     def change_projects_dir(self):
         p = self.pick_dir()

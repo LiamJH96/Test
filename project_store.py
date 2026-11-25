@@ -248,7 +248,8 @@ MAX_NAME = 80
 
 def safe_name(name):
     """A folder/file name that is valid on Windows, macOS and Linux, as close to name as possible."""
-    s = _ILLEGAL.sub("_", str(name or ""))
+    s = str(name or "").replace(": ", " - ").replace(":", "-")
+    s = _ILLEGAL.sub("_", s)
     s = re.sub(r"\s+", " ", s).strip().rstrip(". ").lstrip()
     s = s[:MAX_NAME].rstrip(". ")
     if not s or set(s) <= {"_", "."}:

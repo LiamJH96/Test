@@ -140,9 +140,13 @@ def compute_thumbs(path, dur):
     try:
         d = tempfile.mkdtemp(prefix="cs_th_")
         iv = max(1.0, dur / 120.0)
-        subprocess.run([FFMPEG, "-v", "error", "-threads", "2", "-skip_frame", "nokey", "-i", path, "-an", "-vf",
-                        f"fps=1/{iv:.3f},scale=-2:80", "-q:v", "6", os.path.join(d, "t%05d.jpg")], creationflags=LOWPRI)
-        files = sorted(os.listdir(d))
+        for skip in (["-skip_frame", "nokey"], []):   # key frames only is fast; short / long-GOP clips need all
+            subprocess.run([FFMPEG, "-v", "error", "-threads", "2", *skip, "-i", path, "-an", "-vf",
+                            f"fps=1/{iv:.3f},scale=-2:80", "-q:v", "6", os.path.join(d, "t%05d.jpg")],
+                           creationflags=LOWPRI)
+            files = sorted(os.listdir(d))
+            if files:
+                break
         if files:
             THUMBS[path] = (iv, [os.path.join(d, f) for f in files])
             BUS.wave.emit()
@@ -223,6 +227,18 @@ def mk_icon(name, color="#e6e6eb", size=22):
     elif name == "grid":
         for x, y in ((4, 4), (12.5, 4), (4, 12.5), (12.5, 12.5)):
             p.drawRoundedRect(QRectF(x, y, 5.5, 5.5), 1.2, 1.2)
+    elif name == "export":
+        p.drawPolyline(QPolygonF([P(4, 13), P(4, 18), P(18, 18), P(18, 13)]))
+        p.drawLine(P(11, 3.5), P(11, 14))
+        p.drawPolyline(QPolygonF([P(7, 7.5), P(11, 3.5), P(15, 7.5)]))
+    elif name == "check":
+        p.drawPolyline(QPolygonF([P(4.5, 11.5), P(9, 16), P(17.5, 6.5)]))
+    elif name == "warn":
+        p.drawPolygon(QPolygonF([P(11, 3.5), P(19.5, 18.5), P(2.5, 18.5)]))
+        p.drawLine(P(11, 9), P(11, 13))
+        p.drawPoint(P(11, 15.8))
+    elif name == "folder":
+        p.drawPolyline(QPolygonF([P(3, 17.5), P(3, 5), P(8.5, 5), P(10.5, 7.5), P(19, 7.5), P(19, 17.5), P(3, 17.5)]))
     elif name == "chev_down":
         p.drawPolyline(QPolygonF([P(6, 8.5), P(11, 13.5), P(16, 8.5)]))
     p.end()
@@ -1210,7 +1226,7 @@ COL = {"sub": QColor(150, 70, 150), "video": QColor(54, 112, 190), "image": QCol
 TL = dict(bg="#141518", lane="#17181B", lane_main="#1A1B1F", lane_line="#222328", head="#1B1C1F",
           head_edge="#26272C", head_text="#A6A8B0", head_text_main="#E8E9EC", ruler="#1B1C1F",
           tick="#34353B", tick_minor="#2A2B30", ruler_text="#8A8C95", playhead="#F2555A",
-          accent="#4886EC", select="#F2F3F5", empty="#767880", empty_title="#A6A8B0")
+          accent="#7FE5FF", select="#F2F3F5", empty="#767880", empty_title="#A6A8B0")
 TLC = {k: QColor(v) for k, v in TL.items()}
 TRACK_STYLE = {   # body, band (name strip), edge (1px border), wave
     "video":   ("#34557A", "#2A4563", "#4E77A6", "#9FBBE0"),
@@ -1295,7 +1311,7 @@ class Timeline(QWidget):
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.th = TH              # track height: grows/shrinks with the timeline (see resizeEvent)
-        self.setMinimumHeight(RULER + 40 * len(TRACKS) + 4)
+        self.setMinimumHeight(RULER + 30 * len(TRACKS) + 4)
         self.setFocusPolicy(Qt.StrongFocus)
         BUS.wave.connect(self._invalidate)
         # fonts and pens made once, not on every repaint
@@ -1318,7 +1334,7 @@ class Timeline(QWidget):
         self.c_dim = QColor(0, 0, 0, 50)
         self.c_lift = QColor(255, 255, 255, 18)
         self.c_drag = QColor(255, 255, 255, 30)
-        self.c_accent_fill = QColor(72, 134, 236, 36)
+        self.c_accent_fill = QColor(127, 229, 255, 28)
 
     def _invalidate(self):
         self._ver += 1
@@ -1326,7 +1342,7 @@ class Timeline(QWidget):
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
-        self.th = max(40, min(64, (self.height() - RULER - 4) // len(TRACKS)))
+        self.th = max(30, min(64, (self.height() - RULER - 4) // len(TRACKS)))
 
     # coordinates
     def tx(self, t):
@@ -1575,6 +1591,8 @@ class Timeline(QWidget):
                 p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
             if c is dragging:
                 p.fillPath(path, self.c_drag)
+                p.setPen(QPen(TLC["select"], 1))
+                p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
             ti = trans_info(self.win.clips, c)
             if ti:                       # transition chip: same place as before, so clicking it still works
                 b = QRectF(r.left() - 8, r.center().y() - 8, 16, 16)
@@ -1597,10 +1615,17 @@ class Timeline(QWidget):
                 p.drawLine(QPointF(cx, cy - 4.5), QPointF(cx, cy + 4.5))
             p.setRenderHint(QPainter.Antialiasing, False)
         acc = TLC["accent"]
-        if self.mode in ("move", "trimL", "trimR") and self._snap_t is not None:
-            xs = int(self.tx(self._snap_t))
-            p.setPen(QPen(acc, 1))
-            p.drawLine(xs, RULER, xs, RULER + self.th * nt)
+        if self.mode == "move" and dragging is not None and getattr(self, "orig", None):
+            s0, _, d0, tr0 = self.orig              # faint ghost where the clip came from
+            if abs(s0 - dragging.start) > 1e-3 or tr0 != dragging.track:
+                g = QRectF(self.tx(s0), RULER + tr0 * self.th + 3, d0 * self.pps, self.th - 6)
+                p.setOpacity(0.35)
+                p.setRenderHint(QPainter.Antialiasing, True)
+                p.setPen(QPen(TLC["select"], 1, Qt.DashLine))
+                p.setBrush(TRACK_Q[clip_style(dragging)][0])
+                p.drawRoundedRect(g, 4, 4)
+                p.setRenderHint(QPainter.Antialiasing, False)
+                p.setOpacity(1.0)
         if self.mode == "marquee" and self.mq:
             q = QRectF(self.mq[0], self.mq[1]).normalized()
             p.setPen(QPen(acc, 1))
@@ -1610,20 +1635,33 @@ class Timeline(QWidget):
             kind, ref, st = self.plan
             c = self.win.sel
             y = RULER + c.track * self.th
-            if kind in ("before", "after"):          # insertion marker between clips
+            p.setRenderHint(QPainter.Antialiasing, True)
+            if kind in ("before", "after"):          # insertion marker between clips, drawn over transition chips
                 x = self.tx(ref.start if kind == "before" else ref.end)
                 p.setPen(QPen(acc, 2))
-                p.drawLine(QPointF(x, y + 2), QPointF(x, y + self.th - 2))
+                p.drawLine(QPointF(x, y + 1), QPointF(x, y + self.th - 1))
                 p.setBrush(acc)
                 p.setPen(Qt.NoPen)
-                p.setRenderHint(QPainter.Antialiasing, True)
-                p.drawPolygon(QPolygonF([QPointF(x - 6, y + 2), QPointF(x + 6, y + 2), QPointF(x, y + 9)]))
-                p.setRenderHint(QPainter.Antialiasing, False)
+                p.drawPolygon(QPolygonF([QPointF(x - 4, y + 1), QPointF(x + 4, y + 1), QPointF(x, y + 6)]))
+                p.drawPolygon(QPolygonF([QPointF(x - 4, y + self.th - 1), QPointF(x + 4, y + self.th - 1),
+                                         QPointF(x, y + self.th - 6)]))
             elif abs(st - c.start) > 1e-3:           # it will slide to the nearest free spot
-                p.setPen(QPen(acc, 1.5, Qt.DashLine))
+                p.setPen(QPen(acc, 1, Qt.DashLine))
                 p.setBrush(self.c_accent_fill)
-                p.drawRect(QRectF(self.tx(st), y + 3, c.dur * self.pps, self.th - 6))
+                p.drawRoundedRect(QRectF(self.tx(st), y + 3, c.dur * self.pps, self.th - 6), 4, 4)
+            p.setRenderHint(QPainter.Antialiasing, False)
         p.setClipping(False)
+        if self.mode in ("move", "trimL", "trimR") and self._snap_t is not None:
+            xs = int(self.tx(self._snap_t))          # snap line through the ruler, with a marker on it
+            if xs >= LBL:
+                p.setPen(QPen(acc, 1))
+                p.drawLine(xs, 0, xs, RULER + self.th * nt)
+                p.setRenderHint(QPainter.Antialiasing, True)
+                p.setPen(Qt.NoPen)
+                p.setBrush(acc)
+                p.drawPolygon(QPolygonF([QPointF(xs, RULER - 9), QPointF(xs + 3, RULER - 6), QPointF(xs, RULER - 3),
+                                         QPointF(xs - 3, RULER - 6)]))
+                p.setRenderHint(QPainter.Antialiasing, False)
         if not self.win.clips:
             area = QRectF(LBL, RULER, w - LBL, self.th * nt)
             cy = area.center().y()
@@ -2606,6 +2644,19 @@ def scrolled(w):
 
 
 APP_TITLE = "Parrot Studio"
+
+
+def brand_label():
+    """The Parrot Studio logo (wordmark) for the editor and dashboard headers."""
+    t = QLabel(APP_TITLE)
+    t.setObjectName("title")
+    lg = QPixmap()
+    if lg.loadFromData(base64.b64decode(LOGO_B64)):
+        lg.setDevicePixelRatio(2.0)    # stored at 320x56, shown at 160x28
+        t.setPixmap(lg)
+        t.setToolTip("Parrot Studio")
+    return t
+
 PROJECT_FILTER = "Parrot Studio project (*.clipproj)"
 PROJECT_KEYS = ("substyle", "W", "H", "lib", "clips")      # what project_dict() writes; other keys are kept as-is
 
@@ -2736,6 +2787,7 @@ class MainWindow(QMainWindow):
         cl.setSpacing(8)
         cap_intro = QLabel("Type a caption, then add it to the timeline at the red playhead.")
         cap_intro.setWordWrap(True)
+        cap_intro.setObjectName("hint")
         cl.addWidget(cap_intro)
         self.new_cap = QPlainTextEdit()
         self.new_cap.setPlaceholderText("Using people's voices on a soundboard \U0001F480")
@@ -2832,9 +2884,10 @@ class MainWindow(QMainWindow):
         rv.addWidget(main, 1)
         self.editor_page = root
         # the project home screen and the editor share the window; show_dashboard() / show_editor() switch
-        self.dashboard = Dashboard()
+        self.dashboard = Dashboard(brand=brand_label(), icon=mk_icon, dialogs=sys.modules[__name__])
         self.dashboard.openRequested.connect(self.open_project)
-        self.dashboard.newRequested.connect(self.create_and_open)
+        self.dashboard.newRequested.connect(lambda name: self.create_and_open(name, rename=True))
+        self.dashboard.restoreRequested.connect(lambda p: self.open_project(p, recover="restore"))
         self.pages = QStackedWidget()
         self.pages.addWidget(self.editor_page)
         self.pages.addWidget(self.dashboard)
@@ -2878,6 +2931,7 @@ class MainWindow(QMainWindow):
         sc("Ctrl+E", self.export, False)
         sc("Ctrl+Shift+S", self.save_project_as, False)
         sc("Ctrl+N", self.new_project, False, editor=False)
+        sc("F2", self.start_rename)
 
         self.timer = QTimer(self)
         self.timer.setInterval(16)
@@ -3008,50 +3062,53 @@ class MainWindow(QMainWindow):
         hd = QHBoxLayout()
         hd.setContentsMargins(12, 6, 12, 6)
         hd.setSpacing(8)
-        self.b_home = btn("", "Back to your projects", self.show_dashboard, "round", "grid", (28, 28))
-        hd.addWidget(self.b_home)
-        t = QLabel(APP_TITLE)
-        t.setObjectName("title")
-        lg = QPixmap()
-        if lg.loadFromData(base64.b64decode(LOGO_B64)):
-            lg.setDevicePixelRatio(2.0)    # stored at 320x56, shown at 160x28
-            t.setPixmap(lg)
-            t.setToolTip("Parrot Studio")
+        t = brand_label()                                   # the logo; in the editor it leads back to the projects
+        t.setToolTip("Back to projects")
+        t.setCursor(Qt.PointingHandCursor)
+        t.mousePressEvent = lambda ev: self.show_dashboard() if ev.button() == Qt.LeftButton else None
         hd.addWidget(t)
-        crumb = QLabel("/")
-        crumb.setObjectName("crumb")
-        hd.addWidget(crumb)
+        hd.addSpacing(12)
+        hd.addWidget(sep())
+        hd.addSpacing(4)
         self.b_proj = QPushButton("Untitled")
         self.b_proj.setObjectName("projectName")
-        self.b_proj.setToolTip("Project options: rename, show in folder, save a copy, back to your projects")
+        self.b_proj.setToolTip("Project options")
         self.b_proj.setCursor(Qt.PointingHandCursor)
         self.b_proj.setIcon(mk_icon("chev_down", "#A6A8B0"))
-        self.b_proj.setIconSize(QSize(12, 12))
+        self.b_proj.setIconSize(QSize(10, 10))
         self.b_proj.setLayoutDirection(Qt.RightToLeft)       # chevron after the name
+        self.b_proj.setMaximumWidth(320)
         self.b_proj.clicked.connect(self.project_menu)
         hd.addWidget(self.b_proj)
+        self.name_edit = QLineEdit()                          # inline rename (F2), shown in place of the name
+        self.name_edit.setObjectName("projectNameEdit")
+        self.name_edit.setFixedWidth(240)
+        self.name_edit.hide()
+        self.name_edit.installEventFilter(self)
+        self.name_edit.returnPressed.connect(self.finish_rename)
+        hd.addWidget(self.name_edit)
         self.lbl_save = QPushButton("")
         self.lbl_save.setObjectName("saveState")
-        self.lbl_save.setCursor(Qt.PointingHandCursor)
+        self.lbl_save.setIconSize(QSize(12, 12))
+        self.lbl_save.setMinimumWidth(130)
         self.lbl_save.clicked.connect(self.save_state_clicked)
         hd.addWidget(self.lbl_save)
-        hd.addSpacing(8)
-        hd.addWidget(btn("Open project", "Open a saved project", self.open_project, "ghost"))
-        hd.addWidget(btn("Save project", "Save the project  (Ctrl+S)", self.save_project, "ghost"))
         hd.addStretch(1)
         self.cb_canvas = QComboBox()
         self.cb_canvas.addItems(list(CANVAS))
         self.cb_canvas.setToolTip("Shape of the video you are making")
         self.cb_canvas.setMinimumWidth(170)
         self.cb_canvas.currentTextChanged.connect(self.set_canvas)
-        hd.addWidget(field("Canvas"))
+        self.lbl_canvas = field("Canvas")
+        hd.addWidget(self.lbl_canvas)
         hd.addWidget(self.cb_canvas)
         hd.addSpacing(12)
         self.cb_fps = QComboBox()
         self.cb_fps.addItems(["30", "60"])
         self.cb_fps.setToolTip("Frame rate of the exported video")
         self.cb_fps.setFixedWidth(72)
-        hd.addWidget(field("Frame rate"))
+        self.lbl_fps = field("Frame rate")
+        hd.addWidget(self.lbl_fps)
         hd.addWidget(self.cb_fps)
         hd.addSpacing(12)
         hd.addWidget(sep())
@@ -3062,6 +3119,8 @@ class MainWindow(QMainWindow):
         hd.addSpacing(12)
         b_exp = btn("Export video", "Render the finished video to an MP4 file", self.export, "primary")
         b_exp.setMinimumWidth(112)
+        b_exp.setIcon(mk_icon("export", "#FFFFFF"))
+        b_exp.setIconSize(QSize(16, 16))
         hd.addWidget(b_exp)
         self.header = QWidget()
         self.header.setLayout(hd)
@@ -3164,6 +3223,11 @@ class MainWindow(QMainWindow):
         if n != getattr(self, "_hint_n", None):
             self._hint_n = n
             self.sb_hint.setText(hint_html(HINTS[:n]))
+        narrow = self.width() < 1180                    # header: make room for the project name
+        self.b_proj.setMaximumWidth(200 if narrow else 320)
+        self.lbl_canvas.setVisible(not narrow)
+        self.lbl_fps.setVisible(not narrow)
+        self.update_title()
 
     def showEvent(self, ev):
         super().showEvent(ev)
@@ -3171,7 +3235,8 @@ class MainWindow(QMainWindow):
             self._split_done = True
             tot = sum(self.main_split.sizes())
             if tot > 0:
-                b = max(self.main_split.widget(1).minimumSizeHint().height(), min(360, int(tot * 0.42)))
+                share = 0.40 if tot < 560 else 0.42
+                b = max(self.main_split.widget(1).minimumSizeHint().height(), min(360, int(tot * share)))
                 self.main_split.setSizes([tot - b, b])
         self.view.fit()
 
@@ -3232,6 +3297,7 @@ class MainWindow(QMainWindow):
         rl = QHBoxLayout(rb)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(8)
+        self.fit_btns = []
         for txt, tip, mode in [("Fit", "Fit the whole clip inside the video", "fit"),
                                ("Fill", "Zoom the clip to cover the whole video", "fill"),
                                ("Reset", "Back to centred and normal size", "reset")]:
@@ -3239,6 +3305,7 @@ class MainWindow(QMainWindow):
             b.setToolTip(tip)
             b.clicked.connect(lambda _=False, m=mode: self.set_fit(m))
             rl.addWidget(b)
+            self.fit_btns.append(b)
         tab("Adjust", [("", rb), ("Size", self.p_scale), ("X", self.p_x), ("Y", self.p_y),
                        ("Image length", self.p_dur)],
             "Tip: click the clip in the preview, then drag it to move it or drag a corner handle to resize it. "
@@ -3257,17 +3324,44 @@ class MainWindow(QMainWindow):
         lay.setSpacing(4)
         eyebrow = QLabel("Selected clip")
         eyebrow.setObjectName("eyebrow")
+        self.p_eyebrow = eyebrow
         lay.addWidget(eyebrow)
         lay.addWidget(self.p_name)
         lay.addSpacing(8)
         lay.addWidget(tabs, 1)
+        # shown instead of the tabs while nothing is selected
+        emp = QWidget()
+        el = QVBoxLayout(emp)
+        el.setContentsMargins(24, 0, 24, 0)
+        el.setSpacing(0)
+        el.addStretch(1)
+        ic = QLabel()
+        ic.setPixmap(mk_icon("fit", "#4F5158", 32).pixmap(32, 32))
+        ic.setAlignment(Qt.AlignHCenter)
+        el.addWidget(ic)
+        el.addSpacing(8)
+        t1 = QLabel("No clip selected")
+        t1.setObjectName("emptyHead")
+        t1.setAlignment(Qt.AlignHCenter)
+        el.addWidget(t1)
+        el.addSpacing(4)
+        t2 = QLabel("Click a clip on the timeline to edit it.")
+        t2.setObjectName("hint")
+        t2.setWordWrap(True)
+        t2.setFixedWidth(220)
+        t2.setAlignment(Qt.AlignHCenter)
+        el.addWidget(t2, 0, Qt.AlignHCenter)
+        el.addStretch(2)
+        emp.hide()
+        self.p_empty = emp
+        lay.addWidget(emp, 1)
         return w
 
     def emoji_row(self, edit):
         w = QWidget()
         g = QGridLayout(w)            # 6 x 2 grid: fits narrow panels
         g.setContentsMargins(0, 0, 0, 0)
-        g.setSpacing(2)
+        g.setSpacing(4)
         for i, e in enumerate(EMOJI_PICK):
             b = QPushButton(e)
             b.setFixedSize(28, 28)
@@ -3283,14 +3377,17 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 12, 4, 0)
         v.setSpacing(8)
+        v.addWidget(QLabel("Caption text"))
         self.cap_edit = QPlainTextEdit()
         self.cap_edit.setPlaceholderText("Select a caption on the timeline to edit its text")
         self.cap_edit.setFixedHeight(84)
         self.cap_edit.textChanged.connect(self.apply_caption)
         v.addWidget(self.cap_edit)
-        v.addWidget(self.emoji_row(self.cap_edit))
+        self.cap_emoji = self.emoji_row(self.cap_edit)
+        v.addWidget(self.cap_emoji)
         f = QFormLayout()
         self.cap_font = QFontComboBox()
+        self.cap_font.setEditable(False)
         self.cap_font.setMinimumContentsLength(12)
         self.cap_font.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.cap_font.setCurrentFont(QFont(default_font()))
@@ -3328,7 +3425,8 @@ class MainWindow(QMainWindow):
         n.setObjectName("hint")
         v.addWidget(n)
         v.addStretch(1)
-        self.cap_widgets = [self.cap_edit, self.cap_font, self.cap_size, self.cap_bold, self.cap_box, self.cap_bcol, self.cap_tcol]
+        self.cap_widgets = [self.cap_edit, self.cap_font, self.cap_size, self.cap_bold, self.cap_box, self.cap_bcol,
+                            self.cap_tcol, b_font, self.cap_emoji]
         return w
 
     def load_font(self):
@@ -3393,7 +3491,7 @@ class MainWindow(QMainWindow):
         self.sub_model.addItems(["tiny", "base", "small", "medium", "large-v3"])
         self.sub_model.setCurrentText("small")
         self.sub_lang = QLineEdit("en")
-        self.sub_lang.setFixedWidth(50)
+        self.sub_lang.setPlaceholderText("en, de, auto...")
         self.sub_gpu = QCheckBox("GPU")
         self.sub_vad = QCheckBox("Skip silence")
         self.sub_vad.setChecked(True)
@@ -3410,9 +3508,10 @@ class MainWindow(QMainWindow):
         gen = QGroupBox("Auto subtitles")
         gf = QFormLayout(gen)
         self._form_style(gf)
+        gf.setContentsMargins(0, 8, 0, 0)
         gf.addRow("Model", self.sub_model)
         gf.addRow("Language", self.sub_lang)
-        gf.addRow("Words per subtitle", self.sub_maxwords)
+        gf.addRow("Words per line", self.sub_maxwords)
         row = QHBoxLayout()
         row.addWidget(self.sub_gpu)
         row.addWidget(self.sub_vad)
@@ -3426,6 +3525,7 @@ class MainWindow(QMainWindow):
         gf.addRow(hint)
 
         self.sub_font = QFontComboBox()
+        self.sub_font.setEditable(False)
         self.sub_font.setMinimumContentsLength(12)
         self.sub_font.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.sub_font.setCurrentFont(QFont("Rubik" if "Rubik" in fams else "Arial"))
@@ -3456,9 +3556,11 @@ class MainWindow(QMainWindow):
         self.sub_anim_ms.setRange(50, 1500)
         self.sub_anim_ms.setSingleStep(50)
         self.sub_anim_ms.setValue(200)
+        self.sub_anim_ms.setSuffix(" ms")
         sty = QGroupBox("Subtitle look (all subtitles)")
         sf = QFormLayout(sty)
         self._form_style(sf)
+        sf.setContentsMargins(0, 8, 0, 0)
         sf.addRow("Font", self.sub_font)
         r2 = QHBoxLayout()
         r2.addWidget(self.sub_bold)
@@ -3468,14 +3570,14 @@ class MainWindow(QMainWindow):
         sf.addRow("Text colour", self.sub_cmain)
         sf.addRow("Not yet spoken", self.sub_cunsp)
         sf.addRow("Outline colour", self.sub_cout)
-        sf.addRow("( ) round tag colour", self.sub_ctag)
-        sf.addRow("[ ] square tag colour", self.sub_ctag2)
+        sf.addRow("( ) tag colour", self.sub_ctag)
+        sf.addRow("[ ] tag colour", self.sub_ctag2)
         sf.addRow("Outline width", self.sub_outline)
-        sf.addRow("Vertical position", self.sub_ypos)
-        sf.addRow("Horizontal position", self.sub_xpos)
+        sf.addRow("Vertical", self.sub_ypos)
+        sf.addRow("Horizontal", self.sub_xpos)
         sf.addRow("Animation", self.sub_anim)
-        sf.addRow("Tag animation ( )", self.sub_tag_anim)
-        sf.addRow("Animation ms", self.sub_anim_ms)
+        sf.addRow("Tag animation", self.sub_tag_anim)
+        sf.addRow("Anim. length", self.sub_anim_ms)
         dr = QHBoxLayout()
         bsave = QPushButton("Save as my default")
         bsave.setToolTip("Every new session starts with the subtitle look you have set here")
@@ -3495,8 +3597,12 @@ class MainWindow(QMainWindow):
             cb.changed.connect(self.sub_changed)
         inner = QWidget()
         iv = QVBoxLayout(inner)
-        iv.setContentsMargins(12, 0, 12, 12)
+        iv.setContentsMargins(12, 12, 12, 12)
         iv.setSpacing(8)
+        sub_intro = QLabel("Generate subtitles from the speech in your clips, then style them below.")
+        sub_intro.setObjectName("hint")
+        sub_intro.setWordWrap(True)
+        iv.addWidget(sub_intro)
         iv.addWidget(gen)
         iv.addWidget(sty)
         iv.addStretch(1)
@@ -3512,7 +3618,7 @@ class MainWindow(QMainWindow):
     def _form_style(f):
         """Forms in narrow panels: fields stretch, long rows wrap instead of being cut off."""
         f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        f.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        f.setRowWrapPolicy(QFormLayout.DontWrapRows)
         f.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         f.setHorizontalSpacing(12)
         f.setVerticalSpacing(8)
@@ -3781,6 +3887,10 @@ class MainWindow(QMainWindow):
             iscap = bool(c and c.nat)
             for wdg in self.cap_widgets:
                 wdg.setEnabled(iscap)
+            if not iscap and self.cap_edit.toPlainText():
+                self.cap_edit.blockSignals(True)          # never show the previous caption's text greyed out
+                self.cap_edit.clear()
+                self.cap_edit.blockSignals(False)
             if iscap:
                 if self.cap_edit.toPlainText() != c.text:
                     self.cap_edit.setPlainText(c.text)
@@ -3791,6 +3901,10 @@ class MainWindow(QMainWindow):
                 self.cap_bcol.setIcon(swatch_icon(c.cbox))
                 self.cap_tcol.setIcon(swatch_icon(c.ccol))
             issub = bool(c and c.kind == "sub")
+            if not issub and self.sub_edit.toPlainText():
+                self.sub_edit.blockSignals(True)
+                self.sub_edit.clear()
+                self.sub_edit.blockSignals(False)
             self.sub_edit.setEnabled(issub)
             for b in getattr(self, "sub_quick", ()):
                 b.setEnabled(issub)
@@ -3829,8 +3943,42 @@ class MainWindow(QMainWindow):
                     for wdg in (self.p_fin, self.p_fout, self.p_vol, self.p_scale, self.p_x, self.p_y, self.p_dur,
                                 self.p_trans, self.p_tdur):
                         wdg.setEnabled(False)
+            for b in getattr(self, "fit_btns", ()):
+                b.setEnabled(bool(c) and c.kind not in ("audio", "sub"))
+            self.show_inspector_tabs(c)
         finally:
             self._loading = False
+
+    def show_inspector_tabs(self, c):
+        """Only the inspector tabs that do something for the selected clip; an empty state when none is selected."""
+        n = len(self.selected())
+        if c is None:
+            vis = set()
+        elif n > 1:
+            vis = {"Fade"}
+        elif c.kind == "sub":
+            vis = {"Subtitle"}
+        elif c.kind == "audio":
+            vis = {"Fade", "Audio"}
+        else:
+            vis = {"Fade", "Adjust", "Transition"}
+            if c.nat:
+                vis.add("Caption")
+            if c.kind == "video" and c.hasaudio:
+                vis.add("Audio")
+        self.ptabs.setVisible(bool(vis))
+        self.p_empty.setVisible(not vis)
+        self.p_name.setVisible(bool(vis))
+        self.p_eyebrow.setText(f"{n} clips selected" if n > 1 else "Selected clip")
+        self.p_eyebrow.setVisible(bool(vis))
+        for i in range(self.ptabs.count()):
+            self.ptabs.setTabVisible(i, self.ptabs.tabText(i) in vis)
+        if vis and self.ptabs.tabText(self.ptabs.currentIndex()) not in vis:
+            first = {"audio": "Audio", "image": "Adjust"}.get(c.kind, "Fade") if n == 1 else "Fade"
+            for name in (first, "Caption", "Subtitle", "Fade", "Adjust", "Audio"):
+                if name in vis:
+                    self.goto_tab(name)
+                    break
 
     def apply_props(self, *_):
         c = self.sel
@@ -4481,10 +4629,18 @@ class MainWindow(QMainWindow):
         if self.on_dashboard():
             self.setWindowTitle(APP_TITLE)
             return
-        nm = os.path.basename(self.proj_path) if self.proj_path else "Untitled"
-        self.setWindowTitle(f"{APP_TITLE} - {nm}{' *' if self.is_dirty() else ''}")
-        if getattr(self, "b_proj", None) is not None:
-            self.b_proj.setText(self.project_name())
+        # "<name> – Parrot Studio"; no dirty star (autosave), except when saving failed or there is no file yet
+        nm = self.project_name()
+        note = " (not saved)" if (self.save_state == "failed" or (not self.proj_path and self.is_dirty())) else ""
+        self.setWindowTitle(f"{nm}{note} \u2013 {APP_TITLE}")
+        b = getattr(self, "b_proj", None)
+        if b is not None:
+            f = QFont(b.font())
+            f.setWeight(QFont.DemiBold)
+            shown = QFontMetrics(f).elidedText(nm, Qt.ElideRight, b.maximumWidth() - 40)
+            b.setText(shown)
+            b.setMinimumWidth(min(b.maximumWidth(), QFontMetrics(f).horizontalAdvance(shown) + 44))
+            b.setToolTip(f"{nm}\nProject options" if self.proj_path else "Project options")
             if not self.proj_path:
                 self.set_save_state("untitled" if self.is_dirty() else "")
 
@@ -4496,6 +4652,7 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentWidget(self.editor_page)
         for s in self.editor_shortcuts:
             s.setEnabled(True)
+        self.statusBar().show()
         self.sb_hint.show()
         self.update_title()
         self.tl.setFocus()
@@ -4513,13 +4670,14 @@ class MainWindow(QMainWindow):
             s.setEnabled(False)
         self.sb_hint.hide()
         self.statusBar().clearMessage()
+        self.statusBar().hide()
         self.dashboard.refresh()
         self.update_title()
         self.dashboard.focus_first()
         return True
 
     def close_project(self):
-        """Empty the editor. The project must already be saved (see leave_project)."""
+        """Empty the editor. The project must already be saved (see leave_project). The playhead time is kept."""
         if self.playing:
             self.toggle_play()
         for t in (self.save_timer, self.save_max_timer, self.rec_timer):
@@ -4532,7 +4690,6 @@ class MainWindow(QMainWindow):
             self.sel = None
             self.undo.clear()
             self.redo.clear()
-            self.t = 0.0
             self.apply_sub_style(self.sub_factory())
             self.load_sub_defaults()
             self.cb_canvas.setCurrentIndex(0)
@@ -4715,36 +4872,65 @@ class MainWindow(QMainWindow):
                 self._post(lambda: self.status(f"Couldn't write a recovery copy: {err}", 12000))
         self.writer.submit(("rec", path), lambda: store.write_recovery(path, text), done)
 
+    SAVE_STATES = {   # text, icon, icon colour
+        "": ("", None, None),
+        "untitled": ("Not saved yet", None, None),
+        "pending": ("Edited", None, None),
+        "saving": ("Saving\u2026", None, None),
+        "saved": ("Saved", "check", "#767880"),
+        "failed": ("Couldn't save \u00b7 Retry", "warn", "#F07A7E"),
+        "conflict": ("Changed on disk", "warn", "#E2A33B"),
+    }
+
     def set_save_state(self, st):
+        """The little save indicator next to the project name ('Saved', 'Saving…', 'Couldn't save · Retry'...).
+        Public so screenshots and tests can show every state."""
+        b = getattr(self, "lbl_save", None)
+        now = time.monotonic()
+        if b is not None and st in ("saved", "pending") and self.save_state == "saving":
+            left = 0.6 - (now - getattr(self, "_saving_since", 0.0))
+            if left > 0:                  # keep "Saving…" up long enough to read, so it never just flickers
+                self.save_state = st
+                QTimer.singleShot(int(left * 1000) + 10, lambda: self._show_save_state(self.save_state))
+                return
+        if st == "saving" and self.save_state != "saving":
+            self._saving_since = now
+        prev = self.save_state
         self.save_state = st
+        self._show_save_state(st)
+        if (prev == "failed") != (st == "failed"):
+            self.update_title()
+
+    def _show_save_state(self, st):
         b = getattr(self, "lbl_save", None)
         if b is None:
             return
-        first = (self.save_error or "").split("\n")[-1]
-        text, tip = {
-            "": ("", ""),
-            "untitled": ("Not saved yet", "This project isn't stored in a file yet. Click to choose where to keep it."),
-            "pending": ("Saving…", "Your changes are stored automatically in a moment."),
-            "saving": ("Saving…", "Storing your changes…"),
-            "saved": ("Saved", f"Every change is stored automatically in\n{self.proj_path}"),
-            "failed": ("Not saved", f"Autosave failed: {first}\nYour changes are kept in a recovery copy. "
-                                    "Click to try again."),
-            "conflict": ("Changed on disk", "The project file was changed by another program, so autosave is "
-                                            "paused. Click to choose what to do."),
-        }[st]
+        text, icon, col = self.SAVE_STATES[st]
+        first = (self.save_error or "").strip().split("\n")[-1]
+        tip = {
+            "untitled": "This project isn't stored in a file yet. Click to choose where to keep it.",
+            "pending": "Your changes are stored automatically in a moment.",
+            "saving": "Storing your changes\u2026",
+            "saved": f"All changes saved \u00b7 {time.strftime('%H:%M')}\n{self.proj_path or ''}",
+            "failed": f"{first}\nYour changes are kept in a recovery copy. Click to try again.",
+            "conflict": "The project file was changed by another program, so autosave is paused. "
+                        "Click to choose what to do.",
+        }.get(st, "")
         b.setText(text)
         b.setToolTip(tip)
+        b.setIcon(mk_icon(icon, col) if icon else QIcon())
+        b.setCursor(Qt.PointingHandCursor if st in ("failed", "conflict", "untitled") else Qt.ArrowCursor)
         if b.property("state") != st:
             b.setProperty("state", st)
             b.style().unpolish(b)
             b.style().polish(b)
-        b.setVisible(bool(text))
 
     def save_state_clicked(self):
         st = self.save_state
         if st == "conflict":
             self.resolve_conflict()
         elif st == "failed":
+            self.status("Trying to save again\u2026")
             self.autosave()
         elif st == "untitled":
             self.save_project()
@@ -4869,22 +5055,77 @@ class MainWindow(QMainWindow):
     def project_menu(self):
         m = QMenu(self)
         has = bool(self.proj_path)
-        m.addAction("Rename…", self.rename_project).setEnabled(has)
-        m.addAction("Open project folder", lambda: reveal_in_file_manager(self.proj_path)).setEnabled(has)
-        m.addSeparator()
-        m.addAction("Save\tCtrl+S", self.save_project)
-        m.addAction("Save as…\tCtrl+Shift+S", self.save_project_as)
-        m.addSeparator()
-        m.addAction("New project…\tCtrl+N", self.new_project)
-        m.addAction("Back to projects", self.show_dashboard)
-        m.exec(self.b_proj.mapToGlobal(QPoint(0, self.b_proj.height() + 2)))
 
-    def rename_project(self):
+        def act(text, fn, keys=None, enabled=True):
+            a = m.addAction(text, fn)
+            if keys:                      # shown in the menu only: the real shortcuts are the window's sc(...) ones
+                a.setShortcut(QKeySequence(keys))
+                a.setShortcutContext(Qt.WidgetShortcut)
+                a.setShortcutVisibleInContextMenu(True)
+            a.setEnabled(enabled)
+            return a
+        act("Rename\u2026", self.start_rename, "F2", has)
+        act("Save", self.save_project, "Ctrl+S")
+        act("Save as\u2026", self.save_project_as, "Ctrl+Shift+S")
+        act("Show in folder", lambda: reveal_in_file_manager(self.proj_path), enabled=has)
+        m.addSeparator()
+        act("New project", self.new_project, "Ctrl+N")
+        act("Open project\u2026", self.open_project, "Ctrl+O")
+        m.addSeparator()
+        act("Back to projects", self.show_dashboard)
+        self.b_proj.setProperty("open", True)
+        self.b_proj.style().unpolish(self.b_proj)
+        self.b_proj.style().polish(self.b_proj)
+        try:
+            m.exec(self.b_proj.mapToGlobal(QPoint(0, self.b_proj.height() + 4)))
+        finally:
+            self.b_proj.setProperty("open", False)
+            self.b_proj.style().unpolish(self.b_proj)
+            self.b_proj.style().polish(self.b_proj)
+            m.deleteLater()
+
+    def start_rename(self):
+        """F2 / Rename…: edit the project name right in the header."""
         if not self.proj_path:
             return self.save_project()
-        name, ok = QInputDialog.getText(self, "Rename project", "New name:", QLineEdit.Normal, self.project_name())
+        if self.on_dashboard():
+            return
+        self.name_edit.setText(self.project_name())
+        self.b_proj.hide()
+        self.name_edit.show()
+        self.name_edit.setFocus(Qt.OtherFocusReason)
+        self.name_edit.selectAll()
+
+    def finish_rename(self, commit=True):
+        if not self.name_edit.isVisible():
+            return
+        name = self.name_edit.text().strip()
+        self.name_edit.hide()
+        self.b_proj.show()
+        if commit and name and name != self.project_name():
+            self.rename_project(name)
+        self.tl.setFocus()
+
+    def eventFilter(self, obj, ev):
+        if obj is getattr(self, "name_edit", None):
+            if ev.type() == ev.Type.KeyPress and ev.key() == Qt.Key_Escape:
+                self.finish_rename(commit=False)
+                return True
+            if ev.type() == ev.Type.FocusOut and obj.isVisible():
+                QTimer.singleShot(0, lambda: self.finish_rename(commit=False))
+        return super().eventFilter(obj, ev)
+
+    def rename_project(self, name=None):
+        """Rename the open project (and its folder). Without a name: ask with a dialog."""
+        if not self.proj_path:
+            return self.save_project()
+        if name is None:
+            name, ok = QInputDialog.getText(self, "Rename project", "New name:", QLineEdit.Normal,
+                                            self.project_name())
+            if not ok:
+                return False
         name = (name or "").strip()
-        if not ok or not name or name == self.project_name():
+        if not name or name == self.project_name():
             return False
         if not self.leave_project("rename"):
             return False
@@ -4902,14 +5143,10 @@ class MainWindow(QMainWindow):
         return True
 
     def new_project(self):
-        if self.on_dashboard():
-            return self.dashboard.new_project()
-        name, ok = QInputDialog.getText(self, "New project", "Name your project:", QLineEdit.Normal,
-                                        self.dashboard.suggest_name())
-        if ok and name.strip():
-            self.create_and_open(name.strip())
+        """Ctrl+N: a new project straight away ("Untitled video"), with its name ready to be typed over."""
+        return self.create_and_open(self.dashboard.suggest_name(), rename=True)
 
-    def create_and_open(self, name, data=None):
+    def create_and_open(self, name, data=None, rename=False):
         """Make a new project in the projects folder and open it (the current one is saved first)."""
         if not self.on_dashboard() and (self.proj_path or self.is_dirty()) and not self.leave_project("new"):
             return False
@@ -4918,7 +5155,10 @@ class MainWindow(QMainWindow):
         except store.ProjectError as e:
             QMessageBox.warning(self, "Could not create the project", str(e))
             return False
-        return self.open_project(p, recover=False)
+        ok = self.open_project(p, recover=False)
+        if ok and rename:
+            QTimer.singleShot(0, self.start_rename)
+        return ok
 
     # ---- thumbnails for the dashboard
     def render_thumbnail(self, width=384):
@@ -5168,7 +5408,15 @@ class MainWindow(QMainWindow):
                 return False
             clips = [Clip(**c) for c in d["clips"]]
         saved_snap = json.dumps([c.to_dict() for c in clips])
-        rec = self.offer_recovery(p) if recover and not restore else None
+        if recover == "restore" and not restore:     # the dashboard's Restore button: no need to ask again
+            info = store.find_recovery(p)
+            try:
+                rec = (info, store.load_recovery(info)) if info else None
+            except store.ProjectError as e:
+                QMessageBox.warning(self, "Could not recover", f"The recovered changes could not be read:\n{e}")
+                rec = None
+        else:
+            rec = self.offer_recovery(p) if recover and not restore else None
         if rec is not None:
             try:
                 rclips = [Clip(**c) for c in rec[1]["clips"]]
@@ -5402,33 +5650,45 @@ QToolTip { background: #2A2B30; color: #E8E9EC; border: 1px solid #3A3B42; paddi
 QWidget#header { background: #1B1C1F; border-bottom: 1px solid #26272C; }
 QWidget#transport { background: #1B1C1F; border-top: 1px solid #26272C; }
 QWidget#toolbar { background: #1B1C1F; border-bottom: 1px solid #26272C; }
-QLabel#title { font-size: 14px; font-weight: 600; color: #E8E9EC; padding-right: 8px; }
-QLabel#crumb { color: #4F5158; font-size: 14px; padding: 0 2px; }
-QPushButton#projectName { background: transparent; border: 1px solid transparent; color: #E8E9EC; font-size: 13px;
-              padding: 4px 8px; }
+QLabel#title { font-size: 14px; font-weight: 600; color: #E8E9EC; padding: 0; }
+QPushButton#projectName { background: transparent; border: 1px solid transparent; border-radius: 4px;
+              padding: 4px 8px; color: #E8E9EC; font-size: 13px; font-weight: 600; text-align: left; }
 QPushButton#projectName:hover { background: #2A2B30; }
-QPushButton#projectName:pressed { background: #232428; }
-QPushButton#saveState { background: transparent; border: none; color: #767880; font-size: 11px; padding: 4px 6px;
-              min-height: 0; }
-QPushButton#saveState:hover { color: #C9CBD1; }
-QPushButton#saveState[state="saved"] { color: #7FBFA0; }
-QPushButton#saveState[state="failed"], QPushButton#saveState[state="conflict"] { color: #F07A7E; }
+QPushButton#projectName:pressed, QPushButton#projectName[open="true"] { background: #232428; border-color: #34353B; }
+QLineEdit#projectNameEdit { font-size: 13px; font-weight: 600; border-color: #7FE5FF; background: #141518; }
+QPushButton#saveState { background: transparent; border: 1px solid transparent; color: #767880; font-size: 11px;
+              padding: 4px 2px; text-align: left; min-height: 18px; max-height: 18px; }
+QPushButton#saveState[state="saving"] { color: #A6A8B0; }
+QPushButton#saveState[state="failed"] { color: #F07A7E; }
+QPushButton#saveState[state="conflict"] { color: #E2A33B; }
+QPushButton#saveState[state="untitled"]:hover, QPushButton#saveState[state="failed"]:hover,
+QPushButton#saveState[state="conflict"]:hover { text-decoration: underline; }
 QPushButton#link { background: transparent; border: none; color: #7FE5FF; padding: 0 4px; min-height: 0; }
 QPushButton#link:hover { color: #B5F0FF; text-decoration: underline; }
 
 /* ---------- project dashboard ---------- */
-QWidget#dashboard, QWidget#dashBody { background: #17181B; }
-QLabel#dashTitle { font-size: 20px; font-weight: 600; color: #E8E9EC; }
-QLabel#dashMeta { color: #767880; }
-QLabel#dashPath { color: #C9CBD1; }
+QWidget#dashboard { background: #141518; }
+QWidget#dashboard QScrollArea, QWidget#dashboard QScrollArea > QWidget > QWidget { background: transparent; }
+QLabel#pageTitle { font-size: 20px; font-weight: 600; color: #E8E9EC; }
+QLabel#projPath { color: #A6A8B0; }
 QLabel#emptyTitle { font-size: 16px; font-weight: 600; color: #E8E9EC; }
-QFrame#recoveryBanner { background: #2B2414; border: 1px solid #4A3B17; border-radius: 6px; }
-QLabel#bannerText { color: #F2D9A0; }
+QLabel#emptyBody { color: #A6A8B0; max-width: 360px; }
+QPushButton#primaryLarge { background: #3A78E0; border: 1px solid #3A78E0; color: #FFFFFF; font-weight: 600;
+              padding: 6px 20px; min-height: 18px; }
+QPushButton#primaryLarge:hover { background: #4886EC; border-color: #4886EC; }
+QPushButton#primaryLarge:pressed { background: #2F67C4; border-color: #2F67C4; }
+QToolButton#cardMenu { border-radius: 4px; padding: 4px; }
+QToolButton#cardMenu:hover { background: #2A2B30; }
+QToolButton#cardMenu::menu-indicator { image: none; width: 0; }
+QLineEdit#cardNameEdit { font-size: 13px; font-weight: 600; border-color: #7FE5FF; background: #141518; }
+QFrame#recoveryBanner { background: #2A2418; border: 1px solid #5A4A2A; border-radius: 8px; }
+QLabel#bannerText { color: #E8E9EC; }
 QLabel#time { font-family: "Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono", monospace;
               font-size: 13px; color: #E8E9EC; }
 QLabel#hint { color: #767880; font-size: 11px; }
 QLabel#field { color: #A6A8B0; }
 QLabel#eyebrow { color: #767880; font-size: 11px; }
+QLabel#emptyHead { color: #A6A8B0; font-size: 13px; font-weight: 600; }
 QLabel#panelTitle { color: #E8E9EC; font-size: 13px; font-weight: 600; }
 QFrame#vsep { color: #2E2F35; }
 
@@ -5460,11 +5720,12 @@ QPushButton#round { background: transparent; border: 1px solid transparent; bord
 QPushButton#round:hover { background: #2A2B30; }
 QPushButton#round:pressed { background: #232428; }
 
-QPushButton#play { background: #E8E9EC; border: none; border-radius: 18px; padding: 0; min-height: 0; }
-QPushButton#play:hover { background: #FFFFFF; }
-QPushButton#play:pressed { background: #C9CBD1; }
+QPushButton#play { background: #7FE5FF; border: none; border-radius: 18px; padding: 0; min-height: 0; }
+QPushButton#play:hover { background: #A6EEFF; }
+QPushButton#play:pressed { background: #5FCFEA; }
 
-QPushButton#emoji { background: transparent; border: none; border-radius: 4px; padding: 0; min-height: 0;
+QPushButton#emoji { background: transparent; border: none; border-radius: 4px; padding: 0;
+              min-height: 28px; max-height: 28px; min-width: 28px; max-width: 28px;
               font-size: 16px; font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"; }
 QPushButton#emoji:hover { background: #2A2B30; }
 QPushButton#emoji:pressed { background: #33343A; }
@@ -5480,9 +5741,12 @@ QToolButton:pressed { background: #232428; }
 QMessageBox QLabel#qt_msgbox_label { min-width: 320px; color: #E8E9EC; }
 QMessageBox QLabel#qt_msgbox_informativelabel { color: #A6A8B0; }
 QMessageBox QPushButton, QInputDialog QPushButton, QProgressDialog QPushButton { min-width: 72px; }
-QMessageBox QPushButton:default, QInputDialog QPushButton:default {
+QMessageBox QPushButton:default, QInputDialog QPushButton:default, QColorDialog QPushButton:default {
               background: #3A78E0; border-color: #3A78E0; color: #FFFFFF; font-weight: 600; }
-QMessageBox QPushButton:default:hover, QInputDialog QPushButton:default:hover { background: #4886EC; border-color: #4886EC; }
+QMessageBox QPushButton:default:hover, QInputDialog QPushButton:default:hover, QColorDialog QPushButton:default:hover { background: #4886EC; border-color: #4886EC; }
+
+QInputDialog { min-width: 320px; }
+QInputDialog QLabel { margin-bottom: 4px; }
 
 /* ---------- text inputs ---------- */
 QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox, QComboBox {
@@ -5491,12 +5755,13 @@ QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox, QComboBox {
 QLineEdit, QAbstractSpinBox { padding: 4px 6px; min-height: 18px; }
 QPlainTextEdit, QTextEdit { padding: 4px; }
 QLineEdit:hover, QPlainTextEdit:hover, QAbstractSpinBox:hover, QComboBox:hover { border-color: #45464E; }
-QLineEdit:focus, QPlainTextEdit:focus, QAbstractSpinBox:focus, QComboBox:focus, QComboBox:on { border-color: #4886EC; }
+QLineEdit:focus, QPlainTextEdit:focus, QAbstractSpinBox:focus, QComboBox:focus, QComboBox:on { border-color: #7FE5FF; }
 QLineEdit:disabled, QPlainTextEdit:disabled, QAbstractSpinBox:disabled, QComboBox:disabled {
               background: #18191C; color: #4F5158; border-color: #26272C; }
 
 /* spin boxes */
-QAbstractSpinBox { padding-right: 20px; }
+QAbstractSpinBox { padding-right: 20px; min-height: 18px; max-height: 18px; }
+QLineEdit { max-height: 18px; }
 QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
               subcontrol-origin: border; width: 18px; border: none; border-left: 1px solid #2A2B30; background: transparent; }
 QAbstractSpinBox::up-button { subcontrol-position: top right; border-top-right-radius: 4px; }
@@ -5531,22 +5796,22 @@ QCheckBox::indicator:checked:disabled { background: #2A3346; border-color: #2A33
 /* ---------- sliders ---------- */
 QSlider { background: transparent; min-height: 20px; }
 QSlider::groove:horizontal { height: 4px; background: #34353B; border-radius: 2px; }
-QSlider::sub-page:horizontal { background: #3A78E0; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #7FE5FF; border-radius: 2px; }
 QSlider::add-page:horizontal { background: #34353B; border-radius: 2px; }
 QSlider::handle:horizontal { width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; background: #E8E9EC; }
 QSlider::handle:horizontal:hover { background: #FFFFFF; }
-QSlider::handle:horizontal:pressed { background: #C9D9F7; }
-QSlider::sub-page:horizontal:disabled { background: #3A3B42; }
+QSlider::handle:horizontal:pressed { background: #A6EEFF; }
+QSlider::sub-page:horizontal:disabled { background: #2E4A52; }
 QSlider::handle:horizontal:disabled { background: #4F5158; }
 
 /* ---------- tabs: flat underline ---------- */
 QTabWidget::pane { border: none; border-top: 1px solid #26272C; top: -1px; background: transparent; }
-QTabWidget::tab-bar { left: 8px; }
+QTabWidget::tab-bar { left: 7px; }
 QTabBar { qproperty-drawBase: 0; background: transparent; }
 QTabBar::tab { background: transparent; color: #A6A8B0; border: none; border-bottom: 2px solid transparent;
-              padding: 8px 6px 6px 6px; margin-right: 2px; }
+              padding: 8px 5px 6px 5px; margin-right: 2px; }
 QTabBar::tab:hover { color: #E8E9EC; }
-QTabBar::tab:selected { color: #E8E9EC; border-bottom-color: #3A78E0; }
+QTabBar::tab:selected { color: #E8E9EC; border-bottom-color: #7FE5FF; }
 QTabBar::tab:disabled { color: #4F5158; }
 QTabBar QToolButton { background: #1B1C1F; border: none; border-radius: 0; width: 16px; }
 QTabBar QToolButton::left-arrow { image: url("@UI@/chev_left.png"); width: 8px; height: 8px; }
@@ -5562,8 +5827,9 @@ QListWidget#transitions::item { min-height: 22px; padding: 3px 10px; }
 QListWidget#library::item { padding: 4px; margin: 2px; }
 
 /* ---------- group boxes: section header with hairline, no box ---------- */
-QGroupBox { border: none; border-top: 1px solid #26272C; margin-top: 22px; padding-top: 10px; background: transparent; }
-QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 0; padding: 0 0 4px 0; color: #E8E9EC; }
+QGroupBox { border: none; border-top: 1px solid #26272C; margin-top: 20px; padding-top: 8px; background: transparent; }
+QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 0; padding: 0 0 4px 0; color: #E8E9EC;
+              font-weight: 600; }
 
 /* ---------- scroll areas & bars ---------- */
 QScrollArea { background: transparent; border: none; }
@@ -5603,7 +5869,7 @@ QStatusBar QLabel { color: #767880; font-size: 11px; padding: 0 8px; }
 /* ---------- progress ---------- */
 QProgressBar { background: #141518; border: 1px solid #26272C; border-radius: 4px; text-align: center;
               color: #E8E9EC; min-height: 16px; max-height: 16px; font-size: 11px; }
-QProgressBar::chunk { background: #3A78E0; border-radius: 3px; }
+QProgressBar::chunk { background: #7FE5FF; border-radius: 3px; }
 QProgressBar#slim { min-height: 6px; max-height: 6px; border: none; background: #2A2B30; border-radius: 3px; }
 QProgressBar#slim::chunk { border-radius: 3px; }
 """

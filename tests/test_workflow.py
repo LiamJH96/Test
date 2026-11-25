@@ -412,6 +412,7 @@ def _project_with_text(w, rich_media, cs):
 
 
 def test_save_with_ctrl_s_and_reopen_with_ctrl_o(ed, modals, rich_media, tmp_path, cs, qapp):
+    from conftest import dispose_window, show_editor, stop_autosave
     w = ed
     _project_with_text(w, rich_media, cs)
     w.cb_canvas.setCurrentIndex(0)
@@ -421,18 +422,23 @@ def test_save_with_ctrl_s_and_reopen_with_ctrl_o(ed, modals, rich_media, tmp_pat
     assert os.path.isfile(proj) and not w.is_dirty()
     d = json.load(open(proj, encoding="utf-8"))
     clips, lib, sub = d["clips"], d["lib"], d["substyle"]
-    # change everything, then open the saved file again (same window, Ctrl+O)
-    w.delete_sel() if w.sel else None
-    w.clips.clear()
-    w.after_edit()
-    w._saved = w.snapshot()
-    modals.open_path = proj
-    key(w, Qt.Key_O, Qt.ControlModifier)
-    flush(50)
-    d2 = w.project_dict()
-    assert d2["clips"] == clips and d2["lib"] == lib and d2["substyle"] == sub
-    assert (w.W, w.H) == (d["W"], d["H"]) and not w.is_dirty()
     assert "roundtrip" in w.windowTitle()
+    dispose_window(w)                           # quit, start again, Ctrl+O the file
+    w2 = cs.MainWindow()
+    try:
+        stop_autosave(w2)
+        show_editor(w2)
+        w2.show()
+        activate(w2)
+        modals.open_path = proj
+        key(w2, Qt.Key_O, Qt.ControlModifier)
+        flush(50)
+        d2 = w2.project_dict()
+        assert d2["clips"] == clips and d2["lib"] == lib and d2["substyle"] == sub
+        assert (w2.W, w2.H) == (d["W"], d["H"]) and not w2.is_dirty()
+        assert "roundtrip" in w2.windowTitle()
+    finally:
+        dispose_window(w2)
 
 
 def test_export_real_video_with_burned_captions_and_subtitles(ed, modals, rich_media, tmp_path, cs):
@@ -524,7 +530,7 @@ CORRUPT = {
     "lib_entry_without_path": json.dumps({"clips": [], "lib": [{"name": "x"}], "W": 1080, "H": 1920}),
     "clip_with_bad_types": json.dumps({"clips": [{"start": "abc", "dur": None, "track": 9}], "W": 1080, "H": 1920}),
 }
-HALF_LOADS = {"no_size", "size_is_text", "lib_entry_without_path", "clip_with_bad_types"}
+HALF_LOADS = {"lib_entry_without_path", "clip_with_bad_types"}    # no_size / size_is_text: fixed in round 2
 
 
 @pytest.mark.parametrize("case", list(CORRUPT))

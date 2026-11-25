@@ -323,6 +323,13 @@ def test_main_window_constructs_and_wiring(win, cs):
     names = {o.objectName() for o in win.findChildren(QWidget)} | {win.header.objectName()}
     assert BASE_OBJECT_NAMES <= names, f"objectNames missing: {BASE_OBJECT_NAMES - names}"
     for key in BUTTONS:
+        if key in ("save", "open") and hasattr(win, "b_proj"):
+            # round 2: Save / Open moved into the header's project-name menu (plan); the shortcuts must remain
+            try:
+                find_button(win, key)
+            except AssertionError:
+                assert norm_key("Ctrl+S" if key == "save" else "Ctrl+O") in all_shortcuts(win)
+            continue
         find_button(win, key)
     for a in ("pps", "t0", "mode", "snap_on", "ripple", "drop_hint", "hov", "hj", "plan"):
         assert hasattr(win.tl, a)
@@ -1216,14 +1223,53 @@ def test_subtitle_preview_paint_and_drag(win, media, flush):
 
 # =============================================================================== 6. persistence
 def test_persisted_paths_unchanged(cs, fake_home):
+    """Round 2 contract: settings live in the Parrot Studio config dir (project_store.config_dir(), env override
+    PARROT_STUDIO_CONFIG_DIR); the old ~/.clip_studio locations are still read (legacy autosave, caches)."""
     base = os.path.join(fake_home, ".clip_studio")
-    assert cs.MainWindow.AUTOSAVE == os.path.join(base, "autosave.clipproj")
-    assert cs.MainWindow.SUB_DEF_FILE == os.path.join(base, "sub_defaults.json")
+    assert cs.MainWindow.AUTOSAVE == os.path.join(base, "autosave.clipproj")     # legacy autosave still offered
     assert cs.EMO_DIR == os.path.join(base, "emoji")
     assert cs.CAP_DIR == os.path.join(base, "captions")
-    src = open(MODULE_FILE, encoding="utf-8").read()
-    if "QSettings" in src and os.path.exists(ORIGINAL_FILE):
-        assert "QSettings" in open(ORIGINAL_FILE, encoding="utf-8").read() or True  # new settings are allowed
+    store = getattr(cs, "store", None)
+    if store is None:                                                          # pre-round-2 app
+        assert cs.MainWindow.SUB_DEF_FILE == os.path.join(base, "sub_defaults.json")
+        return
+    cfg = os.environ["PARROT_STUDIO_CONFIG_DIR"]
+    assert os.path.abspath(store.config_dir()) == os.path.abspath(cfg)
+    assert os.path.abspath(cs.MainWindow.SUB_DEF_FILE) == os.path.join(os.path.abspath(cfg), "sub_defaults.json")
+    assert store.legacy_dir() == base
+
+
+def test_legacy_sub_defaults_are_read_once(cs, qapp, modals, fake_home):
+    """A Clip Studio user's saved subtitle look (~/.clip_studio/sub_defaults.json) is brought over on first run."""
+    store = getattr(cs, "store", None)
+    if store is None:
+        pytest.skip("pre-round-2 app")
+    from conftest import dispose_window
+    legacy = os.path.join(fake_home, ".clip_studio", "sub_defaults.json")
+    new = cs.MainWindow.SUB_DEF_FILE
+    os.makedirs(os.path.dirname(legacy), exist_ok=True)
+    with open(legacy, "w", encoding="utf-8") as f:
+        json.dump({"size": 123, "upper": True}, f)
+    for f_ in (new,):
+        if os.path.exists(f_):
+            os.remove(f_)
+    store.update_settings(lambda d: d.pop("legacy_config_migrated", None))
+    try:
+        w = cs.MainWindow()
+        if hasattr(w, "show_editor"):
+            w.show_editor()
+        w.load_sub_defaults()
+        assert w.sub_style()["size"] == 123 and w.sub_style()["upper"] is True
+        assert os.path.isfile(new) and os.path.isfile(legacy), "copied, the old file is left alone"
+        dispose_window(w)
+        os.remove(new)
+        w = cs.MainWindow()                                        # migrated once: not copied again
+        assert not os.path.exists(new)
+        dispose_window(w)
+    finally:
+        for f_ in (legacy, new):
+            if os.path.exists(f_):
+                os.remove(f_)
 
 
 def test_sub_defaults_save_load_reset(win, cs, qapp, flush):
@@ -1273,9 +1319,11 @@ def test_project_save_load_roundtrip(win, media, modals, tmp_path, cs):
     assert win.save_project() is True
     path = str(tmp_path / "myproj.clipproj")
     assert win.proj_path == path and not win.is_dirty()
-    assert "myproj.clipproj" in win.windowTitle() and "*" not in win.windowTitle()
+    assert "myproj" in win.windowTitle() and "*" not in win.windowTitle()
     d = json.load(open(path, encoding="utf-8"))
-    assert set(d) == BASE_PROJECT_KEYS
+    # round 2 (schema v2) adds exactly "schema" and "meta"; nothing from v1 may be dropped
+    assert set(d) - {"schema", "meta"} == BASE_PROJECT_KEYS
+    assert d.get("schema", 2) == 2 and isinstance(d.get("meta", {}), dict)
     assert (d["W"], d["H"]) == (1920, 1080)
     assert set(d["substyle"]) == BASE_SUBSTYLE_KEYS
     assert all(list(c) == BASE_CLIP_FIELDS for c in d["clips"])
@@ -1323,6 +1371,8 @@ def test_open_project_errors(win, media, modals, tmp_path):
 
 
 def test_autosave_and_restore(win, media, modals, cs):
+    if getattr(cs, "store", None) is not None:
+        return _autosave_and_restore_round2(win, media, modals, cs)
     try:
         os.remove(win.AUTOSAVE)
     except OSError:
@@ -1353,6 +1403,47 @@ def test_autosave_and_restore(win, media, modals, cs):
     try:
         w3.offer_restore()
         assert not os.path.exists(win.AUTOSAVE) and w3.clips == []
+    finally:
+        dispose_window(w3)
+
+
+
+def _autosave_and_restore_round2(win, media, modals, cs):
+    """Round 2 contract: never-saved work goes to a recovery snapshot (project_store), offered at start-up as a new
+    project; the old ~/.clip_studio/autosave.clipproj is only read (see test_recovery.py)."""
+    from PySide6.QtWidgets import QMessageBox
+    store = cs.store
+    for f in (win.AUTOSAVE,):
+        if os.path.exists(f):
+            os.remove(f)
+    store.discard_recovery(None)
+    win.offer_restore()                         # nothing to restore -> no dialog
+    assert "question" not in modals.kinds()
+    win.autosave(wait=True)
+    assert store.find_recovery(None) is None, "an empty project is never autosaved"
+    _build_project(win, media)
+    snap = json.loads(win.snapshot())
+    win.autosave(wait=True)
+    info = store.find_recovery(None)
+    assert info is not None and store.load_recovery(info)["clips"] == snap
+    assert not os.path.exists(win.AUTOSAVE), "nothing is written to the old Clip Studio location any more"
+    w2 = cs.MainWindow()
+    try:
+        modals.question_answer = QMessageBox.Yes
+        w2.offer_restore()
+        assert json.loads(w2.snapshot()) == snap
+        assert w2.proj_path and os.path.isfile(w2.proj_path), "restored as a new project"
+        assert store.find_recovery(None) is None
+    finally:
+        dispose_window(w2)
+    win._saved = "[]"
+    win.autosave(wait=True)
+    assert store.find_recovery(None) is not None
+    modals.question_answer = QMessageBox.No
+    w3 = cs.MainWindow()
+    try:
+        w3.offer_restore()
+        assert store.find_recovery(None) is None and w3.clips == []
     finally:
         dispose_window(w3)
 
@@ -1604,7 +1695,7 @@ def test_empty_paint_and_resizes(win, flush):
 def test_status_and_title(win, media):
     win.status("hello there")
     assert win.statusBar().currentMessage() == "hello there"
-    assert win.windowTitle().startswith("Clip Studio")
+    assert "Parrot Studio" in win.windowTitle() or win.windowTitle().startswith("Clip Studio")   # round 2 rename
     add(win, media["video"])
     win.update_title()
     assert win.windowTitle().endswith("*")
